@@ -31,7 +31,6 @@ from .utils import (
     transaction_type_to_str,
 )
 
-
 AREA_NODE_IDS: tuple[int, ...] = (0x0000, 0x0040, 0x0800, 0x0FC0, 0x1000)
 SERVICE_NODE_IDS: tuple[int, ...] = (
     0x0048,

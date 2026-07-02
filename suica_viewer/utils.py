@@ -1,7 +1,6 @@
 import csv
 from .station_code_lookup import StationCodeLookup
 
-
 EQUIPMENT_TYPES: dict[int, str] = {
     0x00: "未定義",
     0x03: "のりこし精算機",
