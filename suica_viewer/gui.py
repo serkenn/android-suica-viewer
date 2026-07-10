@@ -14,6 +14,7 @@ from nfc.tag import Tag
 from nfc.tag.tt3_sony import FelicaStandard
 
 from .auth_client import FelicaRemoteClient, FelicaRemoteClientError
+from .reader_errors import describe_reader_error
 from .station_code_lookup import StationCodeLookup
 from .utils import (
     SYSTEM_CODE,
@@ -1414,9 +1415,15 @@ class SuicaGuiApp:
                     except Exception as exc:
                         self._reset_progress()
                         self._update_status(f"読み取りエラー: {exc}")
-        except IOError as exc:
+        # Catch everything: this runs in a daemon thread, so an escaping exception
+        # kills it silently and the UI waits for a reader that will never arrive.
+        # usb1's USBError is not an OSError, so `except IOError` misses it.
+        except Exception as exc:
             self._reset_progress()
             self._update_status(f"NFC リーダーを初期化できません: {exc}")
+            self._show_error(
+                "NFC リーダーを初期化できません", describe_reader_error(exc)
+            )
 
     def _on_connect(self, tag: Tag) -> bool:
         self._reset_progress()
@@ -1739,6 +1746,10 @@ class SuicaGuiApp:
 
     def _update_status(self, message: str) -> None:
         self.root.after(0, self.status_var.set, message)
+
+    def _show_error(self, title: str, message: str) -> None:
+        # Safe to call from the NFC thread; Tk itself is touched on the main thread.
+        self.root.after(0, messagebox.showerror, title, message)
 
     def _current_local_timestamp(self) -> str:
         local_time = datetime.now().astimezone()

@@ -342,6 +342,7 @@ name = "suica-viewer"
 version = "1.0.0"
 source = { editable = "." }
 dependencies = [
+    { name = "libusb1" },
     { name = "nfcpy" },
 ]
 
@@ -355,7 +356,10 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "nfcpy" }]
+requires-dist = [
+    { name = "libusb1" },
+    { name = "nfcpy" },
+]
 
 [package.metadata.requires-dev]
 build = [{ name = "pyinstaller", specifier = ">=6.21" }]

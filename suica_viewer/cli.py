@@ -2,11 +2,13 @@ import os
 from collections.abc import Iterable
 
 import nfc
+import usb1
 from nfc.clf import RemoteTarget
 from nfc.tag import Tag
 from nfc.tag.tt3_sony import FelicaStandard
 
 from .auth_client import FelicaRemoteClient, FelicaRemoteClientError
+from .reader_errors import describe_reader_error
 from .utils import (
     CARD_TYPE_LABELS,
     SYSTEM_CODE,
@@ -467,7 +469,16 @@ def fix_ic_code_map():
 def main() -> None:
     fix_ic_code_map()
 
-    with nfc.ContactlessFrontend("usb") as clf:
+    # usb1 raises USBError, which does not derive from OSError, so nfcpy's own
+    # `except IOError` lets it through and the user sees a bare traceback.
+    try:
+        clf = nfc.ContactlessFrontend("usb")
+    except (OSError, usb1.USBError) as exc:
+        raise SystemExit(
+            f"NFC リーダーを初期化できません: {describe_reader_error(exc)}"
+        )
+
+    with clf:
         clf.connect(
             rdwr={
                 "targets": ["212F", "424F"],  # FeliCa only
