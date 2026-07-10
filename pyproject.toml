@@ -1,3 +1,7 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "suica-viewer"
 version = "0.1.0"
@@ -7,7 +11,7 @@ authors = [
 ]
 license = {text = "MIT"}
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.10"
 dependencies = [
     "nfcpy",
 ]
@@ -15,15 +19,20 @@ packages = [
     {include = "felica_viewer"}
 ]
 
-[tool.poetry]
+[dependency-groups]
+dev = [
+    "black>=26.3.1",
+    "pytest>=8",
+]
 
-[tool.poetry.group.dev.dependencies]
-black = "^26.3.1"
-
-[tool.poetry.scripts]
+[project.scripts]
 suica-viewer = "suica_viewer.cli:main"
 suica-viewer-gui = "suica_viewer.gui:main"
 
-[build-system]
-requires = ["poetry-core>=2.0.0,<3.0.0"]
-build-backend = "poetry.core.masonry.api"
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# tests import `app` from the repo root rather than from an installed distribution
+pythonpath = ["."]
