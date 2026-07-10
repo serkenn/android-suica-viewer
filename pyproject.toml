@@ -15,14 +15,14 @@ requires-python = ">=3.10"
 dependencies = [
     "nfcpy",
 ]
-packages = [
-    {include = "felica_viewer"}
-]
 
 [dependency-groups]
 dev = [
     "black>=26.3.1",
     "pytest>=8",
+]
+build = [
+    "pyinstaller>=6.21",
 ]
 
 [project.scripts]
@@ -30,9 +30,9 @@ suica-viewer = "suica_viewer.cli:main"
 suica-viewer-gui = "suica_viewer.gui:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["app"]
+packages = ["suica_viewer"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# tests import `app` from the repo root rather than from an installed distribution
+# tests import `suica_viewer` from the repo root rather than from an installed distribution
 pythonpath = ["."]
