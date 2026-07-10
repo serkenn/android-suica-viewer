@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "suica-viewer"
-version = "1.0.0"
+version = "1.0.1"
 description = ""
 authors = [
     {name = "KIRISHIKI Yudai", email = "yudai.kirishiki@protonmail.com"}
