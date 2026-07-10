@@ -2,14 +2,27 @@ import http.client
 import json
 import logging
 import socket
+import ssl
 import urllib.parse
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
+
+import certifi
 
 from nfc.tag import tt3
 from nfc.tag.tt3_sony import FelicaStandard
 
 log = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _ssl_context() -> ssl.SSLContext:
+    # Frozen (PyInstaller) builds ship no OpenSSL CA bundle, and the compiled-in
+    # default paths point at the build machine, so ssl.create_default_context()
+    # can't verify anything on an end user's system. certifi's bundled CA set is
+    # collected into the binary, giving a portable trust store.
+    return ssl.create_default_context(cafile=certifi.where())
 
 
 class FelicaRemoteClientError(Exception):
@@ -117,7 +130,7 @@ class _KeepAliveHTTPClient:
     def _create_connection(self, timeout: float) -> http.client.HTTPConnection:
         if self._scheme == "https":
             return http.client.HTTPSConnection(
-                self._hostname, self._port, timeout=timeout
+                self._hostname, self._port, timeout=timeout, context=_ssl_context()
             )
         return http.client.HTTPConnection(self._hostname, self._port, timeout=timeout)
 
