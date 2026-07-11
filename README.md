@@ -73,11 +73,19 @@ uv run suica-viewer
 # AUTH_SERVER_URL=https://example.com uv run suica-viewer
 ```
 
+Output is formatted with a balance summary up top, ANSI colors, and aligned tables (color is disabled automatically when not writing to a TTY or when `NO_COLOR` is set).
+
+Options
+- `--json` — emit JSON instead of the human-readable tables (for scripting)
+- `-v`, `--verbose` — also show detail fields such as device numbers and raw codes
+- `--no-color` — disable ANSI color
+- `--server URL` — auth server URL (takes precedence over `AUTH_SERVER_URL`)
+
 Main output items
 - System issuance information (IDi, PMi)
 - Issuance information 1 & 2 (issuer, issuing station, expiration date, etc.)
 - Attribute information (card type, balance, transaction counter)
-- Transaction history (parses gate entries/exits, purchases, charges, and more)
+- Transaction history (parses gate entries/exits, purchases, charges; also shows the per-transaction balance change)
 - Commuter pass data, gate entry/exit records, SF gate entry information
 
 ## Usage (GUI)
@@ -87,12 +95,33 @@ uv run suica-viewer-gui
 
 The GUI provides:
 - Automatically polls the NFC reader after launch and displays progress while reading when a card is detected
-- Overview tab summarizing key fields
-- Issuance Info tab showing issuer, station, IDs, and other details
-- History tab displaying transaction history in a table with full-text filtering via the input box (`Ctrl+F` / `Cmd+F` to focus)
-- Gates tab showing gate history, device numbers, amounts, commuter sections, and SF gate entry data
-- Other tab for inspecting unknown fields
-- Details tab for viewing the card information JSON and copying it to the clipboard or saving it to a file
+- Overview tab led by a hero card showing the balance prominently, followed by key fields
+- Light/Dark theme toggle in the top-right corner
+- History tab displaying transaction history in a table, with a per-transaction balance-change column (charges highlighted in green), column-header sorting, and full-text filtering via the input box (`Ctrl+F` / `Cmd+F` to focus)
+- Gates tab showing gate history, device numbers, amounts, commuter sections (sortable columns), and SF gate entry data
+- Data tab for viewing the card information JSON — copy to clipboard, save to a file, or export the transaction history as CSV
+
+## Usage (Web GUI)
+A browser cannot access the USB reader or run the authentication relay itself, so `suica-viewer-web` starts a small local server that owns the reader and streams card data to the page over Server-Sent Events.
+
+```bash
+uv run suica-viewer-web
+# opens http://127.0.0.1:8765/ in your browser
+```
+
+- Auto-detects cards and updates the page live (no reload); mirrors the desktop GUI (hero balance, tabbed layout, sortable history with per-transaction deltas, gate table, JSON/CSV export, light/dark theme).
+- Bound to `127.0.0.1` by default. Passing `--host 0.0.0.0` exposes card reading to your LAN — note that sensitive card data would then travel over the network.
+
+Options:
+
+| Flag | Description |
+| --- | --- |
+| `--host` / `--port` | Bind address (default `127.0.0.1:8765`) |
+| `--server URL` | Auth server URL (overrides `AUTH_SERVER_URL`) |
+| `--no-browser` | Do not open a browser on startup |
+| `--demo` | Preview the UI with a built-in sample card (no reader required) |
+
+The web GUI runs from source or an installed wheel (`uv run` / `pip install`); the prebuilt single-file executables cover the CLI and desktop GUI only.
 
 ## Authentication Server Configuration
 - Default: `https://felica-auth.nyaa.ws`

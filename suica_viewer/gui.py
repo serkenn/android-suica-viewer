@@ -1,5 +1,5 @@
+import csv
 import json
-import os
 import threading
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -14,41 +14,15 @@ from nfc.tag import Tag
 from nfc.tag.tt3_sony import FelicaStandard
 
 from .auth_client import FelicaRemoteClient, FelicaRemoteClientError
+from .card_data import (
+    CardData,
+    CardDataService,
+    SystemInfo,
+    resolve_server_url,
+)
 from .reader_errors import describe_reader_error
 from .station_code_lookup import StationCodeLookup
-from .utils import (
-    SYSTEM_CODE,
-    CARD_TYPE_LABELS,
-    equipment_type_to_str,
-    format_date,
-    format_station,
-    format_time,
-    gate_in_out_type_to_str,
-    gate_instruction_type_to_str,
-    idi_bytes_to_str,
-    intermadiate_gate_instruction_type_to_str,
-    issuer_id_to_str,
-    pay_type_to_str,
-    transaction_type_to_str,
-)
-
-AREA_NODE_IDS: tuple[int, ...] = (0x0000, 0x0040, 0x0800, 0x0FC0, 0x1000)
-SERVICE_NODE_IDS: tuple[int, ...] = (
-    0x0048,
-    0x0088,
-    0x0810,
-    0x08C8,
-    0x090C,
-    0x1008,
-    0x1048,
-    0x108C,
-    0x10C8,
-)
-
-READ_COMMAND_CODE = 0x14
-DATA_BLOCK_SIZE = 16
-MAX_BLOCKS_PER_REQUEST = 9
-DEFAULT_AUTH_SERVER_URL = "https://felica-auth.nyaa.ws"
+from .utils import SYSTEM_CODE, format_region, format_yen
 
 SUMMARY_VAR_KEYS: tuple[str, ...] = (
     "idi",
@@ -56,6 +30,7 @@ SUMMARY_VAR_KEYS: tuple[str, ...] = (
     "idm",
     "pmm",
     "card_type",
+    "issuer",
     "balance",
     "last_topup_amount",
     "transaction_number",
@@ -131,75 +106,95 @@ HISTORY_FILTER_FIELDS: tuple[str, ...] = (
     "recorded_by",
 )
 
+# heading text -> (entry key, is_numeric) used by the sortable Treeview columns.
+HISTORY_SORT_KEYS: dict[str, tuple[str, bool]] = {
+    "日時": ("recorded_on", False),
+    "取引種別": ("transaction_type", False),
+    "支払種別": ("pay_type", False),
+    "改札処理": ("gate_instruction_type", False),
+    "入場駅": ("entry_station", False),
+    "出場駅": ("exit_station", False),
+    "差額": ("delta", True),
+    "残高": ("balance", True),
+    "機器": ("recorded_by", False),
+    "通番": ("transaction_number", True),
+}
+GATE_SORT_KEYS: dict[str, tuple[str, bool]] = {
+    "日時": ("date", False),
+    "入出場種別": ("gate_in_out_type", False),
+    "中間処理": ("intermediate_gate_instruction_type", False),
+    "駅": ("station", False),
+    "装置番号": ("device_id_hex", False),
+    "金額": ("amount", True),
+    "定期運賃": ("commuter_pass_fee", True),
+    "定期駅": ("commuter_station", False),
+}
 
-class RemoteCardReader:
-    """Proxy that issues encrypted read commands through the remote server."""
+# CSV export layout for the transaction history.
+HISTORY_CSV_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("日付", "recorded_on"),
+    ("時刻", "transaction_time"),
+    ("取引種別", "transaction_type"),
+    ("支払種別", "pay_type"),
+    ("改札処理", "gate_instruction_type"),
+    ("入場駅", "entry_station"),
+    ("出場駅", "exit_station"),
+    ("差額", "delta"),
+    ("残高", "balance"),
+    ("機器", "recorded_by"),
+    ("通番", "transaction_number"),
+)
 
-    def __init__(self, client: FelicaRemoteClient) -> None:
-        self.client = client
-
-    def read_blocks(self, service_index: int, indexes: Iterable[int]) -> list[bytes]:
-        index_list = list(indexes)
-        blocks: list[bytes] = []
-        for chunk_start in range(0, len(index_list), MAX_BLOCKS_PER_REQUEST):
-            chunk = index_list[chunk_start : chunk_start + MAX_BLOCKS_PER_REQUEST]
-            if not chunk:
-                continue
-            elements = [(service_index, block_index) for block_index in chunk]
-            blocks.extend(self._read_elements(elements))
-        return blocks
-
-    def _read_elements(self, elements: list[tuple[int, int]]) -> list[bytes]:
-        payload = bytes([len(elements)]) + self._elements_to_bytes(elements)
-        response = self.client.encryption_exchange(READ_COMMAND_CODE, payload)
-        if len(response) < 3:
-            raise RuntimeError("リモートサーバーからの応答が不正です。")
-
-        status_flag1, status_flag2 = response[0], response[1]
-        if status_flag1 != 0x00:
-            status_code = (status_flag1 << 8) | status_flag2
-            raise RuntimeError(f"カードがエラーを返しました: 0x{status_code:04X}")
-
-        expected_blocks = len(elements)
-        block_count = response[2]
-        if block_count != expected_blocks:
-            raise RuntimeError("取得したブロック数が一致しません。")
-
-        block_payload = response[3:]
-        expected_length = expected_blocks * DATA_BLOCK_SIZE
-        if len(block_payload) < expected_length:
-            raise RuntimeError("ブロックデータの長さが不正です。")
-        block_payload = block_payload[:expected_length]
-
-        return [
-            block_payload[i * DATA_BLOCK_SIZE : (i + 1) * DATA_BLOCK_SIZE]
-            for i in range(expected_blocks)
-        ]
-
-    @staticmethod
-    def _elements_to_bytes(elements: list[tuple[int, int]]) -> bytes:
-        encoded = bytearray()
-        for service_index, block_number in elements:
-            if not 0 <= service_index < 16:
-                raise ValueError(
-                    "サービスインデックスは 0 から 15 の範囲である必要があります。"
-                )
-            if not 0 <= block_number < 256:
-                raise ValueError(
-                    "ブロック番号は 0 から 255 の範囲である必要があります。"
-                )
-            encoded.append(0x80 | service_index)
-            encoded.append(block_number & 0xFF)
-        return bytes(encoded)
-
-
-@dataclass
-class SystemInfo:
-    idm_hex: str
-    pmm_hex: str
-    idi_hex: str
-    idi_display: str
-    pmi: str
+LIGHT_THEME: dict[str, str] = {
+    "bg": "#f3f4f8",
+    "surface": "#ffffff",
+    "border": "#d1d5db",
+    "text": "#111827",
+    "text_muted": "#6b7280",
+    "heading": "#1f2937",
+    "hero_bg": "#4c6ef5",
+    "hero_fg": "#ffffff",
+    "hero_sub": "#dbe4ff",
+    "tree_even": "#ffffff",
+    "tree_odd": "#f5f7fb",
+    "tree_sel_bg": "#e0ecff",
+    "tree_sel_fg": "#000000",
+    "charge_fg": "#0f7b3f",
+    "heading_bg": "#eef1f7",
+    "progress_trough": "#dbe1ef",
+    "progress_bar": "#4c6ef5",
+    "tab_bg": "#f3f4f8",
+    "tab_sel_bg": "#ffffff",
+    "tab_sel_fg": "#111827",
+    "tab_fg": "#4b5563",
+    "text_widget_bg": "#ffffff",
+    "text_widget_fg": "#111827",
+}
+DARK_THEME: dict[str, str] = {
+    "bg": "#1e1f26",
+    "surface": "#2a2c36",
+    "border": "#3f4250",
+    "text": "#e5e7eb",
+    "text_muted": "#9ca3af",
+    "heading": "#f3f4f6",
+    "hero_bg": "#3b4bbf",
+    "hero_fg": "#ffffff",
+    "hero_sub": "#c7d0ff",
+    "tree_even": "#2a2c36",
+    "tree_odd": "#31333f",
+    "tree_sel_bg": "#3d4b7a",
+    "tree_sel_fg": "#ffffff",
+    "charge_fg": "#4ade80",
+    "heading_bg": "#31333f",
+    "progress_trough": "#3f4250",
+    "progress_bar": "#7c93ff",
+    "tab_bg": "#1e1f26",
+    "tab_sel_bg": "#2a2c36",
+    "tab_sel_fg": "#ffffff",
+    "tab_fg": "#9ca3af",
+    "text_widget_bg": "#23252e",
+    "text_widget_fg": "#e5e7eb",
+}
 
 
 @dataclass(frozen=True)
@@ -209,387 +204,41 @@ class TreeColumnSpec:
     anchor: str | None = None
 
 
-ProgressCallback = Callable[[float], None]
+def _format_currency(value: Any) -> str:
+    return format_yen(value) if isinstance(value, int) else "-"
 
 
-@dataclass
-class CardData:
-    system: SystemInfo
-    issue_primary: dict[str, Any]
-    attribute: dict[str, Any]
-    last_topup: dict[str, Any]
-    unknown: dict[str, Any]
-    transaction_history: list[dict[str, Any]]
-    commuter: dict[str, Any]
-    gate: list[dict[str, Any]]
-    sf_gate: dict[str, Any]
-
-    def to_serializable_dict(self) -> dict[str, Any]:
-        return {
-            "system": {
-                "idm_hex": self.system.idm_hex,
-                "pmm_hex": self.system.pmm_hex,
-                "idi_hex": self.system.idi_hex,
-                "idi_display": self.system.idi_display,
-                "pmi": self.system.pmi,
-            },
-            "issue_primary": dict(self.issue_primary),
-            "attribute": dict(self.attribute),
-            "last_topup": dict(self.last_topup),
-            "unknown": dict(self.unknown),
-            "transaction_history": [dict(entry) for entry in self.transaction_history],
-            "commuter": dict(self.commuter),
-            "gate": [dict(entry) for entry in self.gate],
-            "sf_gate": dict(self.sf_gate),
-        }
+def _format_integer(value: Any) -> str:
+    return f"{value:,}" if isinstance(value, int) else "-"
 
 
-class SuicaCardDataExtractor:
-    """Extracts structured data from a Suica Felica tag."""
-
-    def __init__(
-        self,
-        reader: RemoteCardReader,
-        station_code_lookup: StationCodeLookup,
-    ):
-        self.reader = reader
-        self.station_code_lookup = station_code_lookup
-
-    def _format_station(self, line_code: int, station_order: int) -> str:
-        return format_station(self.station_code_lookup, line_code, station_order)
-
-    def _read_blocks(self, service_index: int, indexes: Iterable[int]) -> list[bytes]:
-        return self.reader.read_blocks(service_index, indexes)
-
-    def _read_single_block(self, service_code: int, index: int) -> bytes:
-        return self._read_blocks(service_code, [index])[0]
-
-    def read_issue_information_primary(self) -> dict[str, Any]:
-        owner_block, personal_block, secondary_idi_block, metadata_block = (
-            self._read_blocks(0, range(4))
-        )
-
-        try:
-            owner_name = owner_block.decode("shift_jis").rstrip()
-        except UnicodeDecodeError:
-            owner_name = owner_block.decode("shift_jis", errors="ignore").rstrip()
-
-        phone_number = personal_block[0:8].hex().upper().rstrip("F")
-        age_code = personal_block[8:9].hex().upper()
-        dob = int.from_bytes(personal_block[9:11], byteorder="big")
-        deposit = int.from_bytes(personal_block[12:14], byteorder="little")
-        issuer_id_hex = metadata_block[0:2].hex().upper()
-        issuer_id = issuer_id_to_str(issuer_id_hex)
-        issued_by_code = metadata_block[2]
-        issued_by = equipment_type_to_str(issued_by_code)
-        issued_station_line = metadata_block[3]
-        issued_station_order = metadata_block[4]
-        issued_station = self._format_station(issued_station_line, issued_station_order)
-        issued_at = int.from_bytes(metadata_block[7:9], byteorder="big")
-        expires_at = int.from_bytes(metadata_block[14:16], byteorder="big")
-
-        return {
-            "owner_name": owner_name,
-            "secondary_issue_id": idi_bytes_to_str(secondary_idi_block),
-            "owner_phone_hex": phone_number,
-            "owner_age_code": age_code,
-            "owner_birthdate": format_date(dob),
-            "deposit": deposit,
-            "issuer_id": issuer_id,
-            "issuer_id_hex": issuer_id_hex,
-            "issued_by_code": issued_by_code,
-            "issued_by": issued_by,
-            "issued_station": issued_station,
-            "issued_at": format_date(issued_at),
-            "expires_at": format_date(expires_at),
-        }
-
-    def read_attribute_information(self) -> dict[str, Any]:
-        block = self._read_single_block(1, 0)
-
-        card_type_code = block[8] >> 4
-        card_type_label = CARD_TYPE_LABELS.get(card_type_code, "不明")
-        region_code = block[8] & 0x0F
-        amount = int.from_bytes(block[11:13], byteorder="little")
-        transaction_number = int.from_bytes(block[14:16], byteorder="big")
-
-        return {
-            "card_type_code": card_type_code,
-            "card_type": card_type_label,
-            "region": region_code,
-            "balance": amount,
-            "transaction_number": transaction_number,
-        }
-
-    def read_unknown_information(self) -> dict[str, Any]:
-        block = self._read_single_block(2, 0)
-
-        amount = int.from_bytes(block[0:2], byteorder="little")
-        issued_at = int.from_bytes(block[8:10], byteorder="big")
-        transaction_number = int.from_bytes(block[14:16], byteorder="big")
-
-        return {
-            "balance": amount,
-            "date": format_date(issued_at),
-            "transaction_number": transaction_number,
-        }
-
-    def read_last_topup_information(self) -> dict[str, Any]:
-        detail_block, *_ = self._read_blocks(3, range(3))
-
-        equipment_code = detail_block[0]
-        station_line = detail_block[1]
-        station_order = detail_block[2]
-        station = self._format_station(station_line, station_order)
-        amount = int.from_bytes(detail_block[5:7], byteorder="little")
-
-        return {
-            "equipment_code": equipment_code,
-            "equipment": equipment_type_to_str(equipment_code),
-            "station": station,
-            "amount": amount,
-        }
-
-    def read_transaction_history(self) -> list[dict[str, Any]]:
-        blocks = self._read_blocks(4, range(20))
-        entries: list[dict[str, Any]] = []
-
-        for index, block in enumerate(blocks):
-            recorded_by = block[0]
-            if recorded_by == 0x00:
-                break
-
-            transaction_type_code = block[1] & 0x7F
-            pay_type_code = block[2]
-            gate_instruction_type_code = block[3]
-            recorded_at = int.from_bytes(block[4:6], byteorder="big")
-
-            entry: dict[str, Any] = {
-                "index": index,
-                "recorded_on": format_date(recorded_at),
-                "recorded_by_code": recorded_by,
-                "recorded_by": equipment_type_to_str(recorded_by),
-                "transaction_type_code": transaction_type_code,
-                "transaction_type": transaction_type_to_str(transaction_type_code),
-                "pay_type_code": pay_type_code,
-                "pay_type": pay_type_to_str(pay_type_code),
-                "gate_instruction_type_code": gate_instruction_type_code,
-                "gate_instruction_type": gate_instruction_type_to_str(
-                    gate_instruction_type_code
-                ),
-            }
-
-            if transaction_type_code == 0x46:
-                time_value = int.from_bytes(block[6:8], byteorder="big")
-                entry["transaction_time"] = format_time(time_value)
-            else:
-                entry_station_line = block[6]
-                entry_station_order = block[7]
-                exit_station_line = block[8]
-                exit_station_order = block[9]
-                entry["entry_station"] = self._format_station(
-                    entry_station_line, entry_station_order
-                )
-                entry["exit_station"] = self._format_station(
-                    exit_station_line, exit_station_order
-                )
-
-            amount = int.from_bytes(block[10:12], byteorder="little")
-            transaction_number = int.from_bytes(block[13:15], byteorder="big")
-            entry["balance"] = amount
-            entry["transaction_number"] = transaction_number
-
-            entries.append(entry)
-
-        return entries
-
-    def read_commuter_pass_information(self) -> dict[str, Any]:
-        primary_block, _, supplemental_block = self._read_blocks(6, range(3))
-
-        start_at = int.from_bytes(primary_block[0:2], byteorder="big")
-        end_at = int.from_bytes(primary_block[2:4], byteorder="big")
-        via1_station = self._format_station(primary_block[12], primary_block[13])
-        via2_station = self._format_station(primary_block[14], primary_block[15])
-
-        return {
-            "valid_from": format_date(start_at),
-            "valid_to": format_date(end_at),
-            "start_station": self._format_station(primary_block[8], primary_block[9]),
-            "end_station": self._format_station(primary_block[10], primary_block[11]),
-            "via1_station": via1_station,
-            "via2_station": via2_station,
-            "issued_at": format_date(
-                int.from_bytes(supplemental_block[5:7], byteorder="big")
-            ),
-        }
-
-    def read_gate_in_out_information(self) -> list[dict[str, Any]]:
-        blocks = self._read_blocks(7, range(3))
-        entries: list[dict[str, Any]] = []
-
-        for index, block in enumerate(blocks):
-            date = int.from_bytes(block[6:8], byteorder="big")
-            time_hex = block[8:10].hex().upper()
-            entries.append(
-                {
-                    "index": index,
-                    "date": format_date(date),
-                    "time": f"{time_hex[0:2]}:{time_hex[2:4]}",
-                    "gate_in_out_type_code": block[0],
-                    "gate_in_out_type": gate_in_out_type_to_str(block[0]),
-                    "intermediate_gate_instruction_type_code": block[1],
-                    "intermediate_gate_instruction_type": (
-                        intermadiate_gate_instruction_type_to_str(block[1])
-                    ),
-                    "station": self._format_station(block[2], block[3]),
-                    "device_id_hex": block[4:6].hex().upper(),
-                    "amount": int.from_bytes(block[10:12], byteorder="little"),
-                    "commuter_pass_fee": int.from_bytes(
-                        block[12:14], byteorder="little"
-                    ),
-                    "commuter_station": self._format_station(block[14], block[15]),
-                }
-            )
-
-        return entries
-
-    def read_sf_gate_in_information(self) -> dict[str, Any]:
-        first_block, second_block = self._read_blocks(8, range(2))
-
-        entry_station_line = first_block[0]
-        entry_station_order = first_block[1]
-        intermadiate_entry_station_line = second_block[4]
-        intermadiate_entry_station_order = second_block[5]
-        intermadiate_exit_station_line = second_block[9]
-        intermadiate_exit_station_order = second_block[10]
-
-        return {
-            "entry_station": self._format_station(
-                entry_station_line, entry_station_order
-            ),
-            "intermediate_entry_date": format_date(
-                int.from_bytes(second_block[0:2], byteorder="big")
-            ),
-            "intermediate_entry_time": second_block[2:4].hex().upper(),
-            "intermediate_entry_station": self._format_station(
-                intermadiate_entry_station_line, intermadiate_entry_station_order
-            ),
-            "unknown_value1_hex": hex(second_block[6]),
-            "intermediate_exit_time": second_block[7:9].hex().upper(),
-            "intermediate_exit_station": self._format_station(
-                intermadiate_exit_station_line, intermadiate_exit_station_order
-            ),
-            "unknown_value2_hex": hex(second_block[11]),
-        }
+def _format_delta(value: Any) -> str:
+    if not isinstance(value, int):
+        return "-"
+    if value > 0:
+        return f"+{value:,} 円"
+    return f"{value:,} 円"
 
 
-class CardDataService:
-    """Coordinates remote reads and assembles card data."""
-
-    def __init__(self, station_code_lookup: StationCodeLookup) -> None:
-        self.station_code_lookup = station_code_lookup
-
-    def collect(
-        self,
-        client: FelicaRemoteClient,
-        *,
-        progress_callback: ProgressCallback | None = None,
-    ) -> CardData:
-        auth_result = client.mutual_authentication(
-            SYSTEM_CODE,
-            list(AREA_NODE_IDS),
-            list(SERVICE_NODE_IDS),
-        )
-        self._update_progress(progress_callback, 30.0)
-
-        system_info = self._build_system_info(client, auth_result)
-
-        reader = RemoteCardReader(client)
-        extractor = SuicaCardDataExtractor(reader, self.station_code_lookup)
-
-        issue_primary = extractor.read_issue_information_primary()
-        self._update_progress(progress_callback, 45.0)
-
-        attribute_info = extractor.read_attribute_information()
-        self._update_progress(progress_callback, 55.0)
-
-        last_topup = extractor.read_last_topup_information()
-        self._update_progress(progress_callback, 65.0)
-
-        unknown_info = extractor.read_unknown_information()
-        self._update_progress(progress_callback, 75.0)
-
-        transaction_history = extractor.read_transaction_history()
-        self._update_progress(progress_callback, 85.0)
-
-        commuter_info = extractor.read_commuter_pass_information()
-        self._update_progress(progress_callback, 92.0)
-
-        gate_info = extractor.read_gate_in_out_information()
-        self._update_progress(progress_callback, 97.0)
-
-        sf_gate_info = extractor.read_sf_gate_in_information()
-        self._update_progress(progress_callback, 100.0)
-
-        return CardData(
-            system=system_info,
-            issue_primary=issue_primary,
-            attribute=attribute_info,
-            last_topup=last_topup,
-            unknown=unknown_info,
-            transaction_history=transaction_history,
-            commuter=commuter_info,
-            gate=gate_info,
-            sf_gate=sf_gate_info,
-        )
-
-    def _build_system_info(
-        self, client: FelicaRemoteClient, auth_result: dict[str, Any]
-    ) -> SystemInfo:
-        idm_hex = client.idm.hex().upper()
-        pmm_hex = client.pmm.hex().upper()
-        idi_hex = (auth_result.get("issue_id") or auth_result.get("idi") or "").upper()
-        pmi_hex = (
-            auth_result.get("issue_parameter") or auth_result.get("pmi") or ""
-        ).upper()
-
-        if not idi_hex:
-            raise RuntimeError("サーバ応答に Issue ID が含まれていません。")
-        if not pmi_hex:
-            raise RuntimeError("サーバ応答に Issue Parameter が含まれていません。")
-
-        try:
-            idi_bytes = bytes.fromhex(idi_hex)
-        except ValueError as exc:
-            raise RuntimeError("Issue ID の形式が不正です。") from exc
-
-        return SystemInfo(
-            idm_hex=idm_hex,
-            pmm_hex=pmm_hex,
-            idi_hex=idi_hex,
-            idi_display=idi_bytes_to_str(idi_bytes),
-            pmi=pmi_hex,
-        )
-
-    @staticmethod
-    def _update_progress(
-        callback: ProgressCallback | None,
-        value: float,
-    ) -> None:
-        if callback is not None:
-            callback(value)
+def _format_hex_clock(value: Any) -> str:
+    if isinstance(value, str) and len(value) >= 4:
+        return f"{value[0:2]}:{value[2:4]}"
+    return "-"
 
 
 class SuicaGuiApp:
     """Tkinter-based GUI that shows Suica IC card information."""
 
     def __init__(self) -> None:
+        self.dark_mode = False
+        self.theme = LIGHT_THEME
         self.root = self._create_root_window()
-        self._configure_style()
         self._initialize_state()
+        self._configure_base_style()
         self._load_station_data()
         self.scrollable_container = self._create_scrollable_container()
         self._build_ui()
+        self._apply_theme()
         self._register_event_handlers()
         self._start_nfc_thread()
 
@@ -605,13 +254,21 @@ class SuicaGuiApp:
             master=self.root, value="カードをかざしてください。"
         )
         self.last_updated_var = tk.StringVar(master=self.root, value="読取日時: —")
+        self.theme_button_var = tk.StringVar(master=self.root, value="🌙 ダーク")
         self.progress_var = tk.DoubleVar(master=self.root, value=0.0)
         self.summary_vars = self._create_string_vars(SUMMARY_VAR_KEYS)
+        self.hero_balance_var = tk.StringVar(master=self.root, value="—")
+        self.hero_subtitle_var = tk.StringVar(master=self.root, value="カード未読取")
         self.history_filter_var = tk.StringVar(master=self.root)
         self.current_history: list[dict[str, Any]] = []
+        self._history_view: list[dict[str, Any]] = []
+        self._gate_view: list[dict[str, Any]] = []
+        self._sort_state: dict[tuple[str, str], bool] = {}
         self.current_card_json = ""
         self.copy_details_button: ttk.Button | None = None
         self.export_details_button: ttk.Button | None = None
+        self.export_csv_button: ttk.Button | None = None
+        self.theme_button: ttk.Button | None = None
         self.history_filter_entry: ttk.Entry | None = None
         self.history_tree: ttk.Treeview | None = None
         self.gate_tree: ttk.Treeview | None = None
@@ -629,7 +286,7 @@ class SuicaGuiApp:
         self.misc_detail_fields = MISC_DETAIL_FIELDS
         misc_keys = [key for _, key in self.misc_detail_fields]
         self.misc_detail_vars = self._create_string_vars(misc_keys)
-        self.server_url = self._resolve_server_url()
+        self.server_url = resolve_server_url()
         self._remote_client: FelicaRemoteClient | None = None
         self.card_data_service: CardDataService | None = None
         self.progress_bar: ttk.Progressbar | None = None
@@ -665,10 +322,6 @@ class SuicaGuiApp:
         self.root.bind("<Command-f>", self._focus_history_filter)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    def _resolve_server_url(self) -> str:
-        value = os.environ.get("AUTH_SERVER_URL", "").strip()
-        return value or DEFAULT_AUTH_SERVER_URL
-
     def _get_remote_client(self, tag: FelicaStandard) -> FelicaRemoteClient:
         if self._remote_client is None:
             self._remote_client = FelicaRemoteClient(self.server_url, tag)
@@ -680,14 +333,16 @@ class SuicaGuiApp:
         self.nfc_thread = threading.Thread(target=self._nfc_loop, daemon=True)
         self.nfc_thread.start()
 
-    def _configure_style(self) -> None:
-        style = ttk.Style(self.root)
+    # ------------------------------------------------------------------ #
+    # Styling / theming                                                  #
+    # ------------------------------------------------------------------ #
+    def _configure_base_style(self) -> None:
+        """Configure theme-independent style bits (fonts, geometry)."""
+        self.style = ttk.Style(self.root)
         try:
-            style.theme_use("clam")
+            self.style.theme_use("clam")
         except tk.TclError:
-            # Fallback to the default theme if "clam" is unavailable.
             pass
-        self.root.configure(bg="#f3f4f8")
 
         base_font = ("Helvetica", 12)
         self.root.option_add("*TLabel.font", base_font)
@@ -695,101 +350,163 @@ class SuicaGuiApp:
         self.root.option_add("*Treeview.font", base_font)
         self.root.option_add("*TEntry.font", base_font)
 
-        style.configure("Main.TFrame", background="#f3f4f8")
-        style.configure("SectionWrapper.TFrame", background="#f3f4f8")
+        self.style.configure("SectionBody.TFrame", borderwidth=1, relief="solid")
+        self.style.configure("Treeview", rowheight=28, borderwidth=0)
+        self.style.configure("Treeview.Heading", font=("Helvetica", 13, "bold"))
+        self.style.configure("Status.TLabel", font=("Helvetica", 16, "bold"))
+        self.style.configure("SummaryKey.TLabel", font=("Helvetica", 12, "bold"))
+        self.style.configure("SummaryValue.TLabel", font=("Helvetica", 12))
+        self.style.configure("Meta.TLabel", font=("Helvetica", 11))
+        self.style.configure("SectionMeta.TLabel", font=("Helvetica", 11))
+        self.style.configure("SectionHeader.TLabel", font=("Helvetica", 13, "bold"))
+        self.style.configure("SubsectionHeader.TLabel", font=("Helvetica", 12, "bold"))
+        self.style.configure("HeroCaption.TLabel", font=("Helvetica", 12, "bold"))
+        self.style.configure("HeroBalance.TLabel", font=("Helvetica", 34, "bold"))
+        self.style.configure("HeroSub.TLabel", font=("Helvetica", 13))
+        self.style.configure("TNotebook", borderwidth=0)
+        self.style.configure("TNotebook.Tab", padding=(14, 7), font=("Helvetica", 12))
+
+    def _apply_theme(self) -> None:
+        """Apply the current palette to every styled and raw widget."""
+        theme = self.theme
+        style = self.style
+
+        self.root.configure(bg=theme["bg"])
+        for name in (
+            "Main.TFrame",
+            "SectionWrapper.TFrame",
+        ):
+            style.configure(name, background=theme["bg"])
         style.configure(
             "SectionBody.TFrame",
-            background="#ffffff",
-            borderwidth=1,
-            relief="solid",
+            background=theme["surface"],
+            bordercolor=theme["border"],
         )
-        style.configure("SectionInner.TFrame", background="#ffffff")
+        style.configure("SectionInner.TFrame", background=theme["surface"])
+        style.configure("Hero.TFrame", background=theme["hero_bg"])
 
         style.configure(
             "Treeview",
-            rowheight=28,
-            background="#ffffff",
-            fieldbackground="#ffffff",
-            borderwidth=0,
+            background=theme["surface"],
+            fieldbackground=theme["surface"],
+            foreground=theme["text"],
         )
         style.configure(
             "Treeview.Heading",
-            font=("Helvetica", 13, "bold"),
-            background="#eef1f7",
-            foreground="#1f2937",
+            background=theme["heading_bg"],
+            foreground=theme["heading"],
             borderwidth=0,
-        )
-        style.configure(
-            "Status.TLabel",
-            font=("Helvetica", 16, "bold"),
-            background="#f3f4f8",
-            foreground="#1f2937",
-        )
-        style.configure(
-            "SummaryKey.TLabel",
-            font=("Helvetica", 12, "bold"),
-            background="#ffffff",
-            foreground="#374151",
-        )
-        style.configure(
-            "SummaryValue.TLabel",
-            font=("Helvetica", 12),
-            background="#ffffff",
-            foreground="#111827",
-        )
-        style.configure(
-            "Meta.TLabel",
-            font=("Helvetica", 11),
-            foreground="#666666",
-            background="#f3f4f8",
-        )
-        style.configure(
-            "SectionMeta.TLabel",
-            font=("Helvetica", 11),
-            foreground="#6b7280",
-            background="#ffffff",
-        )
-        style.configure(
-            "SectionHeader.TLabel",
-            font=("Helvetica", 13, "bold"),
-            background="#f3f4f8",
-            foreground="#1f2937",
-        )
-        style.configure(
-            "SubsectionHeader.TLabel",
-            font=("Helvetica", 12, "bold"),
-            background="#ffffff",
-            foreground="#1f2937",
-        )
-        style.configure("TNotebook", background="#f3f4f8", borderwidth=0)
-        style.configure("TNotebook.Tab", padding=(12, 6), font=("Helvetica", 12))
-        style.map(
-            "TNotebook.Tab",
-            background=[("selected", "#ffffff"), ("!selected", "#f3f4f8")],
-            foreground=[("selected", "#111827"), ("!selected", "#4b5563")],
-        )
-        style.configure(
-            "Status.Horizontal.TProgressbar",
-            troughcolor="#dbe1ef",
-            background="#4c6ef5",
-            bordercolor="#dbe1ef",
         )
         style.map(
             "Treeview",
-            background=[("selected", "#e0ecff")],
-            foreground=[("selected", "#000000")],
+            background=[("selected", theme["tree_sel_bg"])],
+            foreground=[("selected", theme["tree_sel_fg"])],
         )
+
+        style.configure(
+            "Status.TLabel", background=theme["bg"], foreground=theme["heading"]
+        )
+        style.configure(
+            "SummaryKey.TLabel",
+            background=theme["surface"],
+            foreground=theme["text_muted"],
+        )
+        style.configure(
+            "SummaryValue.TLabel",
+            background=theme["surface"],
+            foreground=theme["text"],
+        )
+        style.configure(
+            "Meta.TLabel", background=theme["bg"], foreground=theme["text_muted"]
+        )
+        style.configure(
+            "SectionMeta.TLabel",
+            background=theme["surface"],
+            foreground=theme["text_muted"],
+        )
+        style.configure(
+            "SectionHeader.TLabel",
+            background=theme["bg"],
+            foreground=theme["heading"],
+        )
+        style.configure(
+            "SubsectionHeader.TLabel",
+            background=theme["surface"],
+            foreground=theme["heading"],
+        )
+        style.configure(
+            "HeroCaption.TLabel",
+            background=theme["hero_bg"],
+            foreground=theme["hero_sub"],
+        )
+        style.configure(
+            "HeroBalance.TLabel",
+            background=theme["hero_bg"],
+            foreground=theme["hero_fg"],
+        )
+        style.configure(
+            "HeroSub.TLabel",
+            background=theme["hero_bg"],
+            foreground=theme["hero_sub"],
+        )
+        style.configure("TNotebook", background=theme["bg"])
+        style.map(
+            "TNotebook.Tab",
+            background=[
+                ("selected", theme["tab_sel_bg"]),
+                ("!selected", theme["tab_bg"]),
+            ],
+            foreground=[
+                ("selected", theme["tab_sel_fg"]),
+                ("!selected", theme["tab_fg"]),
+            ],
+        )
+        style.configure(
+            "Status.Horizontal.TProgressbar",
+            troughcolor=theme["progress_trough"],
+            background=theme["progress_bar"],
+            bordercolor=theme["progress_trough"],
+        )
+
+        if hasattr(self, "_scroll_canvas"):
+            self._scroll_canvas.configure(background=theme["bg"])
+        self._configure_tree_tags()
+        if self.details_text is not None:
+            self.details_text.configure(
+                background=theme["text_widget_bg"],
+                foreground=theme["text_widget_fg"],
+                insertbackground=theme["text_widget_fg"],
+            )
+
+    def _configure_tree_tags(self) -> None:
+        theme = self.theme
+        for tree in (self.history_tree, self.gate_tree):
+            if tree is None:
+                continue
+            tree.tag_configure("even", background=theme["tree_even"])
+            tree.tag_configure("odd", background=theme["tree_odd"])
+            tree.tag_configure(
+                "even_charge",
+                background=theme["tree_even"],
+                foreground=theme["charge_fg"],
+            )
+            tree.tag_configure(
+                "odd_charge",
+                background=theme["tree_odd"],
+                foreground=theme["charge_fg"],
+            )
+
+    def _toggle_theme(self) -> None:
+        self.dark_mode = not self.dark_mode
+        self.theme = DARK_THEME if self.dark_mode else LIGHT_THEME
+        self.theme_button_var.set("☀ ライト" if self.dark_mode else "🌙 ダーク")
+        self._apply_theme()
 
     def _create_scrollable_container(self) -> ttk.Frame:
         container = ttk.Frame(self.root, style="Main.TFrame")
         container.pack(fill=tk.BOTH, expand=True)
 
-        canvas = tk.Canvas(
-            container,
-            highlightthickness=0,
-            background="#f3f4f8",
-            borderwidth=0,
-        )
+        canvas = tk.Canvas(container, highlightthickness=0, borderwidth=0)
         scrollbar = ttk.Scrollbar(container, orient=tk.VERTICAL, command=canvas.yview)
         canvas.configure(yscrollcommand=scrollbar.set)
 
@@ -848,6 +565,22 @@ class SuicaGuiApp:
         )
         status_label.grid(row=0, column=0, sticky="w")
 
+        header_controls = ttk.Frame(header_frame, style="Main.TFrame")
+        header_controls.grid(row=0, column=1, sticky="e", padx=(16, 0))
+        ttk.Label(
+            header_controls,
+            textvariable=self.last_updated_var,
+            style="Meta.TLabel",
+            anchor="e",
+        ).pack(side=tk.LEFT, padx=(0, 12))
+        self.theme_button = ttk.Button(
+            header_controls,
+            textvariable=self.theme_button_var,
+            command=self._toggle_theme,
+            width=10,
+        )
+        self.theme_button.pack(side=tk.LEFT)
+
         self.progress_bar = ttk.Progressbar(
             header_frame,
             variable=self.progress_var,
@@ -856,13 +589,6 @@ class SuicaGuiApp:
             style="Status.Horizontal.TProgressbar",
         )
         self.progress_bar.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(12, 0))
-
-        ttk.Label(
-            header_frame,
-            textvariable=self.last_updated_var,
-            style="Meta.TLabel",
-            anchor="e",
-        ).grid(row=0, column=1, sticky="e", padx=(16, 0))
 
         ttk.Separator(main_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(0, 16))
 
@@ -889,6 +615,17 @@ class SuicaGuiApp:
         self._build_history_tab(history_frame)
         self._build_gate_tab(gate_frame)
         self._build_data_tab(data_frame)
+
+    def _build_hero(self, parent: ttk.Frame) -> None:
+        hero = ttk.Frame(parent, style="Hero.TFrame", padding=(24, 20, 24, 20))
+        hero.pack(fill=tk.X, padx=4, pady=(0, 16))
+        ttk.Label(hero, text="残高", style="HeroCaption.TLabel").pack(anchor="w")
+        ttk.Label(
+            hero, textvariable=self.hero_balance_var, style="HeroBalance.TLabel"
+        ).pack(anchor="w")
+        ttk.Label(
+            hero, textvariable=self.hero_subtitle_var, style="HeroSub.TLabel"
+        ).pack(anchor="w", pady=(6, 0))
 
     def _populate_label_value_grid(
         self,
@@ -967,8 +704,7 @@ class SuicaGuiApp:
         parent: ttk.Frame,
         column_specs: Iterable[TreeColumnSpec],
         *,
-        odd_row_color: str,
-        even_row_color: str = "#fafafa",
+        on_sort: Callable[[str], None] | None = None,
     ) -> ttk.Treeview:
         specs = list(column_specs)
         column_ids = [spec.heading for spec in specs]
@@ -976,7 +712,10 @@ class SuicaGuiApp:
             parent, columns=column_ids, show="headings", selectmode="browse"
         )
         for spec in specs:
-            tree.heading(spec.heading, text=spec.heading)
+            heading_kwargs: dict[str, Any] = {"text": spec.heading}
+            if on_sort is not None:
+                heading_kwargs["command"] = lambda c=spec.heading: on_sort(c)
+            tree.heading(spec.heading, **heading_kwargs)
             column_kwargs: dict[str, Any] = {"width": spec.width}
             if spec.anchor:
                 column_kwargs["anchor"] = spec.anchor
@@ -987,12 +726,11 @@ class SuicaGuiApp:
 
         tree.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
         scrollbar.pack(fill=tk.Y, side=tk.RIGHT)
-
-        tree.tag_configure("even", background=even_row_color)
-        tree.tag_configure("odd", background=odd_row_color)
         return tree
 
     def _build_overview_tab(self, frame: ttk.Frame) -> None:
+        self._build_hero(frame)
+
         sections = [
             (
                 "カード識別",
@@ -1002,6 +740,7 @@ class SuicaGuiApp:
                     ("IDi", "idi"),
                     ("PMi", "pmi"),
                     ("カード種別", "card_type"),
+                    ("発行者", "issuer"),
                 ],
             ),
             (
@@ -1127,7 +866,7 @@ class SuicaGuiApp:
 
         history_container = self._create_section(
             frame,
-            "取引履歴",
+            "取引履歴（列見出しクリックで並び替え）",
             padding=(4, 4, 4, 4),
             margin=(0, 0),
             fill="both",
@@ -1135,20 +874,21 @@ class SuicaGuiApp:
         )
 
         history_columns = [
-            TreeColumnSpec("日時", 200),
-            TreeColumnSpec("取引種別", 180),
-            TreeColumnSpec("支払種別", 200),
-            TreeColumnSpec("改札処理", 200),
-            TreeColumnSpec("入場駅", 260),
-            TreeColumnSpec("出場駅", 260),
+            TreeColumnSpec("日時", 190),
+            TreeColumnSpec("取引種別", 160),
+            TreeColumnSpec("支払種別", 180),
+            TreeColumnSpec("改札処理", 180),
+            TreeColumnSpec("入場駅", 240),
+            TreeColumnSpec("出場駅", 240),
+            TreeColumnSpec("差額", 120, "e"),
             TreeColumnSpec("残高", 120, "e"),
-            TreeColumnSpec("機器", 180),
-            TreeColumnSpec("通番", 120, "e"),
+            TreeColumnSpec("機器", 170),
+            TreeColumnSpec("通番", 110, "e"),
         ]
         self.history_tree = self._create_treeview(
             history_container,
             history_columns,
-            odd_row_color="#f5f7fb",
+            on_sort=self._sort_history,
         )
 
         self.history_filter_var.trace_add("write", self._apply_history_filter)
@@ -1156,7 +896,7 @@ class SuicaGuiApp:
     def _build_gate_tab(self, frame: ttk.Frame) -> None:
         gate_container = self._create_section(
             frame,
-            "改札入出場履歴",
+            "改札入出場履歴（列見出しクリックで並び替え）",
             padding=(4, 4, 4, 4),
             margin=(0, 12),
             fill="both",
@@ -1176,7 +916,7 @@ class SuicaGuiApp:
         self.gate_tree = self._create_treeview(
             gate_container,
             gate_columns,
-            odd_row_color="#f5fbf7",
+            on_sort=self._sort_gate,
         )
 
         sf_frame = self._create_section(
@@ -1262,12 +1002,22 @@ class SuicaGuiApp:
         )
         self.export_details_button.pack(side=tk.LEFT, padx=(8, 0))
 
+        self.export_csv_button = ttk.Button(
+            button_row,
+            text="履歴をCSVで書き出し…",
+            command=self._export_history_to_csv,
+            state=tk.DISABLED,
+        )
+        self.export_csv_button.pack(side=tk.LEFT, padx=(8, 0))
+
         text_container = ttk.Frame(details_container, style="SectionInner.TFrame")
         text_container.pack(fill=tk.BOTH, expand=True)
         text_container.columnconfigure(0, weight=1)
         text_container.rowconfigure(0, weight=1)
 
-        self.details_text = tk.Text(text_container, wrap=tk.NONE)
+        self.details_text = tk.Text(
+            text_container, wrap=tk.NONE, borderwidth=0, highlightthickness=0
+        )
         self.details_text.configure(state=tk.DISABLED, font=("TkFixedFont", 11))
 
         y_scroll = ttk.Scrollbar(
@@ -1321,6 +1071,48 @@ class SuicaGuiApp:
 
         self._update_status(f"カード情報を書き出しました: {file_path}")
 
+    def _export_history_to_csv(self) -> None:
+        if not self.current_history:
+            messagebox.showinfo("履歴なし", "取引履歴が読み込まれていません。")
+            return
+
+        file_path = filedialog.asksaveasfilename(
+            title="取引履歴をCSVで書き出し",
+            defaultextension=".csv",
+            filetypes=[
+                ("CSV ファイル", "*.csv"),
+                ("すべてのファイル", "*.*"),
+            ],
+        )
+        if not file_path:
+            return
+
+        try:
+            # utf-8-sig so Excel opens Japanese text without mojibake.
+            with open(file_path, "w", encoding="utf-8-sig", newline="") as output_file:
+                writer = csv.writer(output_file)
+                writer.writerow([header for header, _ in HISTORY_CSV_COLUMNS])
+                for entry in self.current_history:
+                    writer.writerow(
+                        [
+                            self._csv_cell(entry.get(key))
+                            for _, key in HISTORY_CSV_COLUMNS
+                        ]
+                    )
+        except OSError as exc:
+            messagebox.showerror(
+                "書き出しエラー", f"ファイルに保存できませんでした: {exc}"
+            )
+            return
+
+        self._update_status(f"取引履歴を書き出しました: {file_path}")
+
+    @staticmethod
+    def _csv_cell(value: Any) -> str:
+        if value is None:
+            return ""
+        return str(value)
+
     def _clear_history_filter(self) -> None:
         if self.history_filter_var.get():
             self.history_filter_var.set("")
@@ -1360,19 +1152,23 @@ class SuicaGuiApp:
         if self.history_tree is None:
             return
 
+        # Keep a private copy so column sorting reorders the view without
+        # mutating the canonical card-order list (used for CSV export).
+        self._history_view = list(rows)
         self.history_tree.delete(*self.history_tree.get_children())
 
-        for index, entry in enumerate(rows):
+        for index, entry in enumerate(self._history_view):
             entry_station = entry.get("entry_station", "-")
             exit_station = entry.get("exit_station", "-")
             if entry.get("transaction_type_code") == 0x46:
                 entry_station = "—"
                 exit_station = "—"
 
-            transaction_number_display = self._format_integer(
+            transaction_number_display = _format_integer(
                 entry.get("transaction_number")
             )
 
+            delta = entry.get("delta")
             values = (
                 f"{entry['recorded_on']} {entry.get('transaction_time', '')}".strip(),
                 entry.get("transaction_type", "-"),
@@ -1380,12 +1176,42 @@ class SuicaGuiApp:
                 entry.get("gate_instruction_type", "-"),
                 entry_station,
                 exit_station,
-                self._format_currency(entry.get("balance")),
+                _format_delta(delta),
+                _format_currency(entry.get("balance")),
                 entry.get("recorded_by", "-"),
                 transaction_number_display,
             )
-            tag = "odd" if index % 2 else "even"
+            zebra = "odd" if index % 2 else "even"
+            tag = f"{zebra}_charge" if isinstance(delta, int) and delta > 0 else zebra
             self.history_tree.insert("", tk.END, values=values, tags=(tag,))
+
+    def _sort_history(self, column: str) -> None:
+        spec = HISTORY_SORT_KEYS.get(column)
+        if spec is None or not self._history_view:
+            return
+        key, numeric = spec
+        reverse = self._next_sort_direction("history", column)
+        self._history_view.sort(
+            key=lambda entry: _sort_value(entry, key, numeric), reverse=reverse
+        )
+        self._render_history_rows(self._history_view)
+
+    def _sort_gate(self, column: str) -> None:
+        spec = GATE_SORT_KEYS.get(column)
+        if spec is None or not self._gate_view:
+            return
+        key, numeric = spec
+        reverse = self._next_sort_direction("gate", column)
+        self._gate_view.sort(
+            key=lambda entry: _sort_value(entry, key, numeric), reverse=reverse
+        )
+        self._render_gate_rows(self._gate_view)
+
+    def _next_sort_direction(self, tree_name: str, column: str) -> bool:
+        state_key = (tree_name, column)
+        reverse = not self._sort_state.get(state_key, False)
+        self._sort_state[state_key] = reverse
+        return reverse
 
     def _focus_history_filter(self, event: Any | None = None) -> str | None:
         if self.history_filter_entry is None:
@@ -1468,20 +1294,9 @@ class SuicaGuiApp:
             progress_callback=self._set_progress,
         )
 
-    def _format_currency(self, value: Any) -> str:
-        return f"{value:,} 円" if isinstance(value, int) else "-"
-
-    def _format_integer(self, value: Any) -> str:
-        return f"{value:,}" if isinstance(value, int) else "-"
-
     def _format_region(self, region_code: Any) -> str:
         if isinstance(region_code, int):
-            return f"{region_code} (0x{region_code:02X})"
-        return "-"
-
-    def _format_hex_clock(self, value: Any) -> str:
-        if isinstance(value, str) and len(value) >= 4:
-            return f"{value[0:2]}:{value[2:4]}"
+            return format_region(region_code)
         return "-"
 
     def _update_summary(
@@ -1497,12 +1312,14 @@ class SuicaGuiApp:
         self.summary_vars["pmi"].set(system_info.pmi)
         self.summary_vars["idm"].set(system_info.idm_hex)
         self.summary_vars["pmm"].set(system_info.pmm_hex)
-        self.summary_vars["card_type"].set(attribute_info.get("card_type", "-"))
-        self.summary_vars["balance"].set(
-            self._format_currency(attribute_info.get("balance"))
-        )
+        card_type = attribute_info.get("card_type", "-")
+        issuer = issue_primary.get("issuer_id", "-")
+        self.summary_vars["card_type"].set(card_type)
+        self.summary_vars["issuer"].set(issuer)
+        balance_display = _format_currency(attribute_info.get("balance"))
+        self.summary_vars["balance"].set(balance_display)
         self.summary_vars["last_topup_amount"].set(
-            self._format_currency(topup_info.get("amount"))
+            _format_currency(topup_info.get("amount"))
         )
         self.summary_vars["issued_at"].set(issue_primary.get("issued_at", "-"))
         self.summary_vars["expires_at"].set(issue_primary.get("expires_at", "-"))
@@ -1510,8 +1327,13 @@ class SuicaGuiApp:
             issue_primary.get("issued_station", "-")
         )
         self.summary_vars["transaction_number"].set(
-            self._format_integer(attribute_info.get("transaction_number"))
+            _format_integer(attribute_info.get("transaction_number"))
         )
+
+        # Hero card
+        self.hero_balance_var.set(balance_display)
+        subtitle_parts = [part for part in (card_type, issuer) if part and part != "-"]
+        self.hero_subtitle_var.set(" · ".join(subtitle_parts) or "カード読取済み")
 
         start_station = commuter_info.get("start_station")
         end_station = commuter_info.get("end_station")
@@ -1579,13 +1401,11 @@ class SuicaGuiApp:
     ) -> None:
         topup_info = last_topup or {}
         region_display = self._format_region(attribute_info.get("region"))
-        attribute_txn_display = self._format_integer(
+        attribute_txn_display = _format_integer(
             attribute_info.get("transaction_number")
         )
-        unknown_balance_display = self._format_currency(unknown_info.get("balance"))
-        unknown_txn_display = self._format_integer(
-            unknown_info.get("transaction_number")
-        )
+        unknown_balance_display = _format_currency(unknown_info.get("balance"))
+        unknown_txn_display = _format_integer(unknown_info.get("transaction_number"))
 
         detail_values: dict[str, Any] = {
             "owner_name": issue_primary.get("owner_name", "-"),
@@ -1594,18 +1414,18 @@ class SuicaGuiApp:
             "owner_birthdate": issue_primary.get("owner_birthdate", "-"),
             "secondary_issue_id": issue_primary.get("secondary_issue_id", "-"),
             "issuer_id": issue_primary.get("issuer_id", "-"),
-            "deposit": self._format_currency(issue_primary.get("deposit")),
+            "deposit": _format_currency(issue_primary.get("deposit")),
             "issued_by": issue_primary.get("issued_by", "-"),
             "issued_station": issue_primary.get("issued_station", "-"),
             "issued_at": issue_primary.get("issued_at", "-"),
             "expires_at": issue_primary.get("expires_at", "-"),
             "last_topup_equipment": topup_info.get("equipment", "-"),
             "last_topup_station": topup_info.get("station", "-"),
-            "last_topup_amount": self._format_currency(topup_info.get("amount")),
+            "last_topup_amount": _format_currency(topup_info.get("amount")),
             "card_type": attribute_info.get("card_type", "-"),
             "region_display": region_display,
             "attribute_transaction_number": attribute_txn_display,
-            "attribute_balance": self._format_currency(attribute_info.get("balance")),
+            "attribute_balance": _format_currency(attribute_info.get("balance")),
         }
 
         for _, fields in self.card_detail_sections:
@@ -1627,12 +1447,43 @@ class SuicaGuiApp:
         if self.gate_tree is None:
             return
 
-        self.gate_tree.delete(*self.gate_tree.get_children())
         self.current_gate_entries = gate_entries
+        self._render_gate_rows(gate_entries)
         if sf_gate_info is None:
             sf_gate_info = {}
 
-        for index, entry in enumerate(gate_entries):
+        self.sf_gate_vars["entry_station"].set(sf_gate_info.get("entry_station", "-"))
+        self.sf_gate_vars["intermediate_entry"].set(
+            sf_gate_info.get("intermediate_entry_station", "-")
+        )
+        self.sf_gate_vars["intermediate_entry_date"].set(
+            sf_gate_info.get("intermediate_entry_date", "-")
+        )
+        self.sf_gate_vars["intermediate_entry_time"].set(
+            _format_hex_clock(sf_gate_info.get("intermediate_entry_time"))
+        )
+        self.sf_gate_vars["intermediate_exit"].set(
+            sf_gate_info.get("intermediate_exit_station", "-")
+        )
+        self.sf_gate_vars["intermediate_exit_time"].set(
+            _format_hex_clock(sf_gate_info.get("intermediate_exit_time"))
+        )
+        self.sf_gate_vars["unknown_value1"].set(
+            sf_gate_info.get("unknown_value1_hex", "-")
+        )
+        self.sf_gate_vars["unknown_value2"].set(
+            sf_gate_info.get("unknown_value2_hex", "-")
+        )
+
+    def _render_gate_rows(self, entries: list[dict[str, Any]]) -> None:
+        if self.gate_tree is None:
+            return
+
+        # Copy so column sorting reorders the view without mutating card data.
+        self._gate_view = list(entries)
+        self.gate_tree.delete(*self.gate_tree.get_children())
+
+        for index, entry in enumerate(self._gate_view):
             date_value = entry.get("date")
             timestamp = date_value if isinstance(date_value, str) else "-"
             time_value = entry.get("time")
@@ -1645,35 +1496,12 @@ class SuicaGuiApp:
                 entry.get("intermediate_gate_instruction_type", "-"),
                 entry.get("station", "-"),
                 entry.get("device_id_hex", "-"),
-                self._format_currency(entry.get("amount")),
-                self._format_currency(entry.get("commuter_pass_fee")),
+                _format_currency(entry.get("amount")),
+                _format_currency(entry.get("commuter_pass_fee")),
                 entry.get("commuter_station", "-"),
             )
             tag = "odd" if index % 2 else "even"
             self.gate_tree.insert("", tk.END, values=values, tags=(tag,))
-
-        self.sf_gate_vars["entry_station"].set(sf_gate_info.get("entry_station", "-"))
-        self.sf_gate_vars["intermediate_entry"].set(
-            sf_gate_info.get("intermediate_entry_station", "-")
-        )
-        self.sf_gate_vars["intermediate_entry_date"].set(
-            sf_gate_info.get("intermediate_entry_date", "-")
-        )
-        self.sf_gate_vars["intermediate_entry_time"].set(
-            self._format_hex_clock(sf_gate_info.get("intermediate_entry_time"))
-        )
-        self.sf_gate_vars["intermediate_exit"].set(
-            sf_gate_info.get("intermediate_exit_station", "-")
-        )
-        self.sf_gate_vars["intermediate_exit_time"].set(
-            self._format_hex_clock(sf_gate_info.get("intermediate_exit_time"))
-        )
-        self.sf_gate_vars["unknown_value1"].set(
-            sf_gate_info.get("unknown_value1_hex", "-")
-        )
-        self.sf_gate_vars["unknown_value2"].set(
-            sf_gate_info.get("unknown_value2_hex", "-")
-        )
 
     def _populate_history(self, history: list[dict[str, Any]]) -> None:
         self.current_history = history
@@ -1691,10 +1519,13 @@ class SuicaGuiApp:
         self.details_text.configure(state=tk.DISABLED)
         self.current_card_json = text
 
-        if self.copy_details_button is not None:
-            self.copy_details_button.configure(state=tk.NORMAL)
-        if self.export_details_button is not None:
-            self.export_details_button.configure(state=tk.NORMAL)
+        for button in (
+            self.copy_details_button,
+            self.export_details_button,
+            self.export_csv_button,
+        ):
+            if button is not None:
+                button.configure(state=tk.NORMAL)
 
     def _finalize_card_update(self) -> None:
         self.last_updated_var.set(f"読取日時: {self._current_local_timestamp()}")
@@ -1719,13 +1550,17 @@ class SuicaGuiApp:
         self._reset_string_vars(self.commuter_detail_vars)
         self._reset_string_vars(self.misc_detail_vars)
         self._reset_string_vars(self.sf_gate_vars)
+        self.hero_balance_var.set("—")
+        self.hero_subtitle_var.set("カード未読取")
 
         self.current_history = []
+        self._history_view = []
         self.history_filter_var.set("")
         if self.history_tree is not None:
             self.history_tree.delete(*self.history_tree.get_children())
 
         self.current_gate_entries = []
+        self._gate_view = []
         if self.gate_tree is not None:
             self.gate_tree.delete(*self.gate_tree.get_children())
 
@@ -1735,10 +1570,13 @@ class SuicaGuiApp:
             self.details_text.configure(state=tk.DISABLED)
         self.current_card_json = ""
 
-        if self.copy_details_button is not None:
-            self.copy_details_button.configure(state=tk.DISABLED)
-        if self.export_details_button is not None:
-            self.export_details_button.configure(state=tk.DISABLED)
+        for button in (
+            self.copy_details_button,
+            self.export_details_button,
+            self.export_csv_button,
+        ):
+            if button is not None:
+                button.configure(state=tk.DISABLED)
 
         if self._remote_client is not None:
             self._remote_client.close()
@@ -1765,7 +1603,15 @@ class SuicaGuiApp:
         self.root.mainloop()
 
 
-def fix_ic_code_map():
+def _sort_value(entry: dict[str, Any], key: str, numeric: bool) -> tuple:
+    """Sort key that keeps missing values last regardless of type."""
+    value = entry.get(key)
+    if numeric:
+        return (value is None, value if isinstance(value, int) else 0)
+    return (value is None, str(value if value is not None else "").lower())
+
+
+def fix_ic_code_map() -> None:
     FelicaStandard.IC_CODE_MAP[0x31] = ("RC-S???", 1, 1)
 
 

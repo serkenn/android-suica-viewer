@@ -1,4 +1,6 @@
 import csv
+from datetime import date
+
 from .station_code_lookup import StationCodeLookup
 
 EQUIPMENT_TYPES: dict[int, str] = {
@@ -192,13 +194,52 @@ def int_to_time(value: int) -> tuple[int, int, int]:
 
 
 def format_date(value: int) -> str:
+    # Empty date slots come back as all-zero. Year 0 / month 0 / day 0 is not a
+    # real date, so render it as a dash instead of a misleading "2000-00-00".
+    if value == 0:
+        return "—"
     year, month, day = int_to_date(value)
-    return f"{year:02}-{month:02}-{day:02}"
+    return f"{2000 + year:04}-{month:02}-{day:02}"
+
+
+def format_birth_date(value: int, *, reference_year: int | None = None) -> str:
+    """Format a birth date, inferring the century of its two-digit year.
+
+    The on-card year is effectively two digits, so 1999 and 2099 are
+    indistinguishable from the raw value. Every other card date is card-era
+    (2001 onward), so :func:`format_date`'s plain 2000-based reading is correct
+    for them. A birth date, however, can predate 2000, so pick the most recent
+    century that does not put the date in the future (a birth date cannot be
+    later than today). Example: year ``99`` reads as 2099 → not yet reached →
+    1999.
+    """
+    if value == 0:
+        return "—"
+    year, month, day = int_to_date(value)
+    full_year = 2000 + year
+    ref = reference_year if reference_year is not None else date.today().year
+    if full_year > ref:
+        full_year -= 100
+    return f"{full_year:04}-{month:02}-{day:02}"
 
 
 def format_time(value: int) -> str:
     hour, minute, second = int_to_time(value)
     return f"{hour:02}:{minute:02}:{second:02}"
+
+
+def format_yen(value: int) -> str:
+    """Format an integer amount as yen with thousands separators."""
+    return f"{value:,} 円"
+
+
+def format_region(region_code: int) -> str:
+    """Render the attribute region code as both decimal and hex.
+
+    No authoritative name mapping for these codes is available, so the raw
+    value is surfaced rather than fabricating a label.
+    """
+    return f"{region_code} (0x{region_code:02X})"
 
 
 def format_station(

@@ -1,5 +1,7 @@
-import os
-from collections.abc import Iterable
+import argparse
+import json
+import sys
+import unicodedata
 
 import nfc
 import usb1
@@ -8,466 +10,438 @@ from nfc.tag import Tag
 from nfc.tag.tt3_sony import FelicaStandard
 
 from .auth_client import FelicaRemoteClient, FelicaRemoteClientError
+from .card_data import (
+    CardData,
+    CardDataService,
+    resolve_server_url,
+)
 from .reader_errors import describe_reader_error
-from .utils import (
-    CARD_TYPE_LABELS,
-    SYSTEM_CODE,
-    equipment_type_to_str,
-    format_date,
-    format_station,
-    format_time,
-    gate_in_out_type_to_str,
-    gate_instruction_type_to_str,
-    idi_bytes_to_str,
-    intermadiate_gate_instruction_type_to_str,
-    issuer_id_to_str,
-    pay_type_to_str,
-    transaction_type_to_str,
-)
 from .station_code_lookup import StationCodeLookup
-
-AREA_NODE_IDS: tuple[int, ...] = (0x0000, 0x0040, 0x0800, 0x0FC0, 0x1000)
-SERVICE_NODE_IDS: tuple[int, ...] = (
-    0x0048,
-    0x0088,
-    0x0810,
-    0x08C8,
-    0x090C,
-    0x1008,
-    0x1048,
-    0x108C,
-    0x10C8,
-)
-
-READ_COMMAND_CODE = 0x14
-DATA_BLOCK_SIZE = 16
-MAX_BLOCKS_PER_REQUEST = 9
-DEFAULT_AUTH_SERVER_URL = "https://felica-auth.nyaa.ws"
+from .utils import SYSTEM_CODE, format_region, format_yen
 
 
-class RemoteCardReader:
-    """Read encrypted blocks via the remote server."""
+# --------------------------------------------------------------------------- #
+# Terminal helpers                                                            #
+# --------------------------------------------------------------------------- #
+def _char_width(char: str) -> int:
+    return 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
 
-    def __init__(self, client: FelicaRemoteClient) -> None:
-        self.client = client
 
-    def read_blocks(self, service_index: int, indexes: Iterable[int]) -> list[bytes]:
-        index_list = list(indexes)
-        blocks: list[bytes] = []
-        for chunk_start in range(0, len(index_list), MAX_BLOCKS_PER_REQUEST):
-            chunk = index_list[chunk_start : chunk_start + MAX_BLOCKS_PER_REQUEST]
-            if not chunk:
-                continue
-            elements = [(service_index, block_index) for block_index in chunk]
-            blocks.extend(self._read_elements(elements))
-        return blocks
+def display_width(text: str) -> int:
+    """Terminal column width of *text*, counting full-width glyphs as 2."""
+    return sum(_char_width(char) for char in text)
 
-    def _read_elements(self, elements: list[tuple[int, int]]) -> list[bytes]:
-        payload = bytes([len(elements)]) + self._elements_to_bytes(elements)
-        response = self.client.encryption_exchange(READ_COMMAND_CODE, payload)
-        if len(response) < 3:
-            raise RuntimeError("リモートサーバーからの応答が不正です。")
 
-        status_flag1, status_flag2 = response[0], response[1]
-        if status_flag1 != 0x00:
-            status_code = (status_flag1 << 8) | status_flag2
-            raise RuntimeError(f"カードがエラーを返しました: 0x{status_code:04X}")
+def truncate(text: str, width: int) -> str:
+    if display_width(text) <= width:
+        return text
+    out: list[str] = []
+    used = 0
+    for char in text:
+        char_w = _char_width(char)
+        if used + char_w > width - 1:
+            break
+        out.append(char)
+        used += char_w
+    return "".join(out) + "…"
 
-        expected_blocks = len(elements)
-        block_count = response[2]
-        if block_count != expected_blocks:
-            raise RuntimeError("取得したブロック数が一致しません。")
 
-        block_payload = response[3:]
-        expected_length = expected_blocks * DATA_BLOCK_SIZE
-        if len(block_payload) < expected_length:
-            raise RuntimeError("ブロックデータの長さが不正です。")
-        block_payload = block_payload[:expected_length]
+def fit(text: str, width: int, *, align: str = "left") -> str:
+    """Pad/truncate *text* to exactly *width* terminal columns."""
+    text = truncate(text, width)
+    padding = " " * max(0, width - display_width(text))
+    return padding + text if align == "right" else text + padding
 
-        return [
-            block_payload[i * DATA_BLOCK_SIZE : (i + 1) * DATA_BLOCK_SIZE]
-            for i in range(expected_blocks)
+
+class Palette:
+    """ANSI styling that collapses to a no-op when color is disabled."""
+
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled
+
+    def _wrap(self, code: str, text: str) -> str:
+        return f"\033[{code}m{text}\033[0m" if self.enabled else text
+
+    def bold(self, text: str) -> str:
+        return self._wrap("1", text)
+
+    def dim(self, text: str) -> str:
+        return self._wrap("2", text)
+
+    def cyan(self, text: str) -> str:
+        return self._wrap("36", text)
+
+    def green(self, text: str) -> str:
+        return self._wrap("32", text)
+
+
+# --------------------------------------------------------------------------- #
+# Value formatting                                                            #
+# --------------------------------------------------------------------------- #
+def _yen_compact(value: object) -> str:
+    return f"¥{value:,}" if isinstance(value, int) else "—"
+
+
+def _format_delta(value: object) -> str:
+    if not isinstance(value, int):
+        return "—"
+    if value > 0:
+        return f"+{value:,}"
+    return f"{value:,}"
+
+
+def _clean_station(name: object) -> str:
+    if not isinstance(name, str) or not name or name.startswith("不明"):
+        return ""
+    return name
+
+
+def _route_or_time(entry: dict) -> str:
+    if "transaction_time" in entry:
+        return entry["transaction_time"]
+    entry_station = _clean_station(entry.get("entry_station"))
+    exit_station = _clean_station(entry.get("exit_station"))
+    if entry_station and exit_station:
+        return f"{entry_station} → {exit_station}"
+    return entry_station or exit_station or "—"
+
+
+def _hhmm(hex_clock: object) -> str:
+    if isinstance(hex_clock, str) and len(hex_clock) >= 4:
+        return f"{hex_clock[0:2]}:{hex_clock[2:4]}"
+    return "—"
+
+
+# --------------------------------------------------------------------------- #
+# Rendering                                                                   #
+# --------------------------------------------------------------------------- #
+class TextReport:
+    """Renders :class:`CardData` as a colored, aligned console report."""
+
+    def __init__(self, palette: Palette, *, verbose: bool) -> None:
+        self.palette = palette
+        self.verbose = verbose
+        self.lines: list[str] = []
+
+    def render(self, card: CardData) -> str:
+        self.lines = []
+        self._banner("Suica カード情報")
+        self._quick_summary(card)
+        self._identification(card)
+        self._issue_information(card)
+        self._attribute_information(card)
+        self._last_topup(card)
+        if self.verbose:
+            self._misc_information(card)
+        self._transaction_history(card)
+        self._commuter_pass(card)
+        self._gate_history(card)
+        self._sf_gate(card)
+        return "\n".join(self.lines)
+
+    # -- building blocks ---------------------------------------------------- #
+    def _banner(self, title: str) -> None:
+        inner = f"  {title}  "
+        bar = "━" * display_width(inner)
+        self.lines.append(self.palette.cyan(bar))
+        self.lines.append(self.palette.bold(self.palette.cyan(inner)))
+        self.lines.append(self.palette.cyan(bar))
+
+    def _section(self, title: str) -> None:
+        self.lines.append("")
+        self.lines.append(self.palette.bold(title))
+        self.lines.append(self.palette.dim("─" * display_width(title)))
+
+    def _kv(self, pairs: list[tuple[str, str]], *, indent: str = "  ") -> None:
+        width = max((display_width(label) for label, _ in pairs), default=0)
+        for label, value in pairs:
+            self.lines.append(f"{indent}{self.palette.dim(fit(label, width))}  {value}")
+
+    def _quick_summary(self, card: CardData) -> None:
+        balance = card.attribute.get("balance")
+        pairs = [
+            (
+                "残高",
+                (
+                    self.palette.bold(self.palette.green(format_yen(balance)))
+                    if isinstance(balance, int)
+                    else "—"
+                ),
+            ),
+            ("カード種別", card.attribute.get("card_type", "—")),
+            ("発行者", card.issue_primary.get("issuer_id", "—")),
+            ("有効期限", card.issue_primary.get("expires_at", "—")),
         ]
+        self.lines.append("")
+        self._kv(pairs, indent="  ")
 
-    @staticmethod
-    def _elements_to_bytes(elements: list[tuple[int, int]]) -> bytes:
-        encoded = bytearray()
-        for service_index, block_number in elements:
-            if not 0 <= service_index < 16:
-                raise ValueError(
-                    "サービスインデックスは 0 から 15 の範囲である必要があります。"
-                )
-            if not 0 <= block_number < 256:
-                raise ValueError(
-                    "ブロック番号は 0 から 255 の範囲である必要があります。"
-                )
-            encoded.append(0x80 | service_index)
-            encoded.append(block_number & 0xFF)
-        return bytes(encoded)
-
-
-def resolve_server_url() -> str:
-    value = os.environ.get("AUTH_SERVER_URL", "").strip()
-    return value or DEFAULT_AUTH_SERVER_URL
-
-
-def print_section(title: str, *, leading_newline: bool = True) -> None:
-    if leading_newline:
-        print()
-    print(title)
-    print("-" * len(title))
-
-
-def print_item(label: str, value: object) -> None:
-    print(f"  - {label}: {value}")
-
-
-class SuicaTagReporter:
-    """Encapsulates the various Suica information dump routines."""
-
-    def __init__(
-        self,
-        reader: RemoteCardReader,
-        station_code_lookup: StationCodeLookup,
-    ) -> None:
-        self.reader = reader
-        self.station_code_lookup = station_code_lookup
-
-    def _format_station(self, line_code: int, station_order: int) -> str:
-        return format_station(self.station_code_lookup, line_code, station_order)
-
-    def _read_blocks(self, service_index: int, indexes: Iterable[int]) -> list[bytes]:
-        return self.reader.read_blocks(service_index, indexes)
-
-    def _read_single_block(self, service_code: int, index: int) -> bytes:
-        return self._read_blocks(service_code, [index])[0]
-
-    def print_issue_information(self, *, leading_newline: bool = True) -> None:
-        print_section("発行情報", leading_newline=leading_newline)
-        owner_block, personal_block, secondary_idi_block, metadata_block = (
-            self._read_blocks(0, range(4))
+    def _identification(self, card: CardData) -> None:
+        self._section("カード識別")
+        self._kv(
+            [
+                ("IDm", card.system.idm_hex),
+                ("PMm", card.system.pmm_hex),
+                ("IDi", card.system.idi_display),
+                ("PMi", card.system.pmi),
+            ]
         )
 
-        name = owner_block.decode("shift_jis").rstrip()
-        print_item("所有者名", name)
-        print_item("第二発行ID", idi_bytes_to_str(secondary_idi_block))
+    def _issue_information(self, card: CardData) -> None:
+        issue = card.issue_primary
+        self._section("発行情報")
+        pairs = [
+            ("所有者名", issue.get("owner_name") or "—"),
+            ("生年月日", issue.get("owner_birthdate", "—")),
+            ("第二発行ID", issue.get("secondary_issue_id", "—")),
+            ("発行者ID", issue.get("issuer_id", "—")),
+            ("発行機器", issue.get("issued_by", "—")),
+            ("発行駅", issue.get("issued_station", "—")),
+            ("発行日", issue.get("issued_at", "—")),
+            ("有効期限", issue.get("expires_at", "—")),
+            ("デポジット額", format_yen(issue.get("deposit", 0))),
+        ]
+        if self.verbose:
+            pairs.insert(2, ("電話番号(hex)", issue.get("owner_phone_hex") or "—"))
+            pairs.insert(3, ("年齢コード", issue.get("owner_age_code", "—")))
+        self._kv(pairs)
 
-        phone_number = personal_block[0:8].hex().rstrip("f")
-        print_item("所有者電話番号", phone_number)
+    def _attribute_information(self, card: CardData) -> None:
+        attr = card.attribute
+        self._section("属性情報")
+        pairs = [
+            ("カード種別", attr.get("card_type", "—")),
+            ("残高", format_yen(attr.get("balance", 0))),
+            ("取引通番", f"{attr.get('transaction_number', 0):,}"),
+        ]
+        if self.verbose:
+            pairs.append(("地域コード", format_region(attr.get("region", 0))))
+        self._kv(pairs)
 
-        age = personal_block[8:9].hex()
-        print_item("所有者年齢", age)
+    def _last_topup(self, card: CardData) -> None:
+        topup = card.last_topup
+        self._section("最終チャージ情報")
+        self._kv(
+            [
+                ("チャージ機器", topup.get("equipment", "—")),
+                ("チャージ駅", topup.get("station", "—")),
+                ("チャージ金額", format_yen(topup.get("amount", 0))),
+            ]
+        )
 
-        dob = int.from_bytes(personal_block[9:11], byteorder="big")
-        print_item("所有者生年月日", format_date(dob))
+    def _misc_information(self, card: CardData) -> None:
+        misc = card.unknown
+        self._section("その他情報（用途未確定）")
+        self._kv(
+            [
+                ("不明な残高", format_yen(misc.get("balance", 0))),
+                ("不明な日付", misc.get("date", "—")),
+                ("不明な取引通番", f"{misc.get('transaction_number', 0):,}"),
+            ]
+        )
 
-        deposit = int.from_bytes(personal_block[12:14], byteorder="little")
-        print_item("デポジット額", f"{deposit} 円")
+    def _transaction_history(self, card: CardData) -> None:
+        entries = card.transaction_history
+        self._section(f"取引履歴（新しい順・{len(entries)}件）")
+        if not entries:
+            self.lines.append(self.palette.dim("  （記録なし）"))
+            return
 
-        issuer_id_hex = metadata_block[0:2].hex().upper()
-        print_item("発行者ID", issuer_id_to_str(issuer_id_hex))
+        widths = (3, 10, 14, 9, 9)
+        headers = ("No", "日付", "種別", "差額", "残高", "経路 / 時刻")
+        self._table_header(headers, widths)
+        for entry in entries:
+            delta = entry.get("delta")
+            cells = [
+                fit(str(entry["index"] + 1), widths[0], align="right"),
+                fit(entry["recorded_on"], widths[1]),
+                fit(entry.get("transaction_type", "—"), widths[2]),
+                fit(_format_delta(delta), widths[3], align="right"),
+                fit(_yen_compact(entry.get("balance")), widths[4], align="right"),
+                _route_or_time(entry),
+            ]
+            if isinstance(delta, int) and delta > 0:
+                cells[3] = self.palette.green(cells[3])
+            self.lines.append("  " + "  ".join(cells))
 
-        issued_by = metadata_block[2]
-        print_item("発行機器", equipment_type_to_str(issued_by))
+    def _commuter_pass(self, card: CardData) -> None:
+        self._section("定期情報")
+        if not card.has_commuter_pass:
+            self.lines.append(self.palette.dim("  （定期券なし）"))
+            return
+        commuter = card.commuter
+        pairs = [
+            (
+                "区間",
+                f"{commuter.get('start_station', '—')} → "
+                f"{commuter.get('end_station', '—')}",
+            ),
+            ("有効期間", f"{commuter.get('valid_from')} 〜 {commuter.get('valid_to')}"),
+            ("発行日", commuter.get("issued_at", "—")),
+        ]
+        via1 = _clean_station(commuter.get("via1_station"))
+        via2 = _clean_station(commuter.get("via2_station"))
+        vias = " / ".join(v for v in (via1, via2) if v)
+        if vias:
+            pairs.insert(1, ("経由", vias))
+        self._kv(pairs)
 
-        issued_station_line = metadata_block[3]
-        issued_station_order = metadata_block[4]
-        issued_station = self._format_station(issued_station_line, issued_station_order)
-        print_item("発行駅", issued_station)
+    def _gate_history(self, card: CardData) -> None:
+        entries = card.gate
+        self._section(f"改札入出場情報（{len(entries)}件）")
+        if not entries:
+            self.lines.append(self.palette.dim("  （記録なし）"))
+            return
 
-        issued_at = int.from_bytes(metadata_block[7:9], byteorder="big")
-        print_item("発行日", format_date(issued_at))
+        widths = (3, 17, 14, 9)
+        headers = ("No", "日時", "入出場種別", "金額", "駅")
+        self._table_header(headers, widths)
+        for entry in entries:
+            timestamp = f"{entry.get('date', '—')} {entry.get('time', '')}".strip()
+            cells = [
+                fit(str(entry["index"] + 1), widths[0], align="right"),
+                fit(timestamp, widths[1]),
+                fit(entry.get("gate_in_out_type", "—"), widths[2]),
+                fit(_yen_compact(entry.get("amount")), widths[3], align="right"),
+                entry.get("station", "—"),
+            ]
+            self.lines.append("  " + "  ".join(cells))
+            if self.verbose:
+                self.lines.append(
+                    self.palette.dim(
+                        f"       装置番号 {entry.get('device_id_hex', '—')} / "
+                        f"中間処理 {entry.get('intermediate_gate_instruction_type', '—')} / "
+                        f"定期運賃 {_yen_compact(entry.get('commuter_pass_fee'))} / "
+                        f"最寄定期駅 {entry.get('commuter_station', '—')}"
+                    )
+                )
 
-        expires_at = int.from_bytes(metadata_block[14:16], byteorder="big")
-        print_item("有効期限", format_date(expires_at))
+    def _sf_gate(self, card: CardData) -> None:
+        sf = card.sf_gate
+        self._section("SF改札入場情報")
+        if not sf.get("has_record"):
+            self.lines.append(self.palette.dim("  （記録なし）"))
+            return
+        pairs = [
+            ("入場駅", sf.get("entry_station", "—")),
+            ("中間改札入場駅", sf.get("intermediate_entry_station", "—")),
+            (
+                "中間改札入場",
+                f"{sf.get('intermediate_entry_date', '—')} "
+                f"{_hhmm(sf.get('intermediate_entry_time'))}",
+            ),
+            ("中間改札出場駅", sf.get("intermediate_exit_station", "—")),
+            ("中間改札出場時刻", _hhmm(sf.get("intermediate_exit_time"))),
+        ]
+        if self.verbose:
+            pairs.append(("不明値1", sf.get("unknown_value1_hex", "—")))
+            pairs.append(("不明値2", sf.get("unknown_value2_hex", "—")))
+        self._kv(pairs)
 
-    def print_attribute_information(self) -> None:
-        print_section("属性情報")
-        block = self._read_single_block(1, 0)
+    def _table_header(self, headers: tuple[str, ...], widths: tuple[int, ...]) -> None:
+        cells = []
+        for index, header in enumerate(headers):
+            if index < len(widths):
+                align = "right" if header in ("No", "差額", "残高", "金額") else "left"
+                cells.append(fit(header, widths[index], align=align))
+            else:
+                cells.append(header)
+        self.lines.append("  " + self.palette.dim("  ".join(cells)))
 
-        card_type = block[8] >> 4
-        card_type_str = CARD_TYPE_LABELS.get(card_type, "不明")
-        print_item("カード種別", card_type_str)
 
-        region = block[8] & 0x0F
-        print_item("地域", region)
+# --------------------------------------------------------------------------- #
+# NFC flow                                                                     #
+# --------------------------------------------------------------------------- #
+class CliRunner:
+    """Holds the shared state the nfcpy connect callback needs."""
 
-        amount = int.from_bytes(block[11:13], byteorder="little")
-        print_item("残高", f"{amount} 円")
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.json_output: bool = args.json
+        self.verbose: bool = args.verbose
+        self.server_url: str = resolve_server_url(args.server)
+        color_enabled = (
+            not args.no_color and not self.json_output and sys.stdout.isatty()
+        )
+        self.palette = Palette(color_enabled)
+        self.station_code_lookup = StationCodeLookup()
+        self.service = CardDataService(self.station_code_lookup)
 
-        transaction_number = int.from_bytes(block[14:16], byteorder="big")
-        print_item("取引通番", transaction_number)
+    def on_connect(self, tag: Tag) -> None:
+        if not isinstance(tag, FelicaStandard):
+            print("FeliCa 以外のタグを検出しました。", file=sys.stderr)
+            return
 
-    def print_unknown_information(self) -> None:
-        print_section("？？情報")
-        block = self._read_single_block(2, 0)
+        polling_result = tag.polling(SYSTEM_CODE)
+        if len(polling_result) != 2:
+            print("Polling 応答が不正です。", file=sys.stderr)
+            return
+        tag.idm, tag.pmm = polling_result
 
-        amount = int.from_bytes(block[0:2], byteorder="little")
-        print_item("不明な残高", f"{amount} 円")
+        print("カードを読み取っています…", file=sys.stderr, flush=True)
+        client = FelicaRemoteClient(self.server_url, tag)
+        try:
+            card = self.service.collect(client)
+        except FelicaRemoteClientError as exc:
+            print(f"サーバ通信エラー: {exc}", file=sys.stderr)
+            return
+        except Exception as exc:
+            print(f"カード情報の取得に失敗しました: {exc}", file=sys.stderr)
+            return
+        finally:
+            client.close()
 
-        issued_at = int.from_bytes(block[8:10], byteorder="big")
-        print_item("不明な日付", format_date(issued_at))
-
-        transaction_number = int.from_bytes(block[14:16], byteorder="big")
-        print_item("不明な取引通番", transaction_number)
-
-    def print_last_topup_information(self) -> None:
-        print_section("最終チャージ情報")
-        detail_block, *_ = self._read_blocks(3, range(3))
-
-        topup_by = detail_block[0]
-        print_item("チャージ機器", equipment_type_to_str(topup_by))
-
-        topup_station_line = detail_block[1]
-        topup_station_order = detail_block[2]
-        topup_station = self._format_station(topup_station_line, topup_station_order)
-        print_item("チャージ駅", topup_station)
-
-        topup_amount = int.from_bytes(detail_block[5:7], byteorder="little")
-        print_item("チャージ金額", f"{topup_amount} 円")
-
-    def _print_transaction_entry(
-        self,
-        index: int,
-        recorded_by: int,
-        transaction_type: int,
-        pay_type: int,
-        gate_instruction_type: int,
-        recorded_at: int,
-        block: bytes,
-    ) -> None:
-        print(f"[{index:02}] {format_date(recorded_at)}")
-        print_item("機器", equipment_type_to_str(recorded_by))
-        print_item("取引種別", transaction_type_to_str(transaction_type))
-        print_item("支払種別", pay_type_to_str(pay_type))
-        print_item("改札処理", gate_instruction_type_to_str(gate_instruction_type))
-
-        if transaction_type == 0x46:
-            time_value = int.from_bytes(block[6:8], byteorder="big")
-            print_item("取引時刻", format_time(time_value))
+        if self.json_output:
+            print(json.dumps(card.to_serializable_dict(), ensure_ascii=False, indent=2))
         else:
-            entry_station_line = block[6]
-            entry_station_order = block[7]
-            exit_station_line = block[8]
-            exit_station_order = block[9]
-            print_item(
-                "入場駅",
-                self._format_station(entry_station_line, entry_station_order),
-            )
-            print_item(
-                "出場駅",
-                self._format_station(exit_station_line, exit_station_order),
-            )
-
-        amount = int.from_bytes(block[10:12], byteorder="little")
-        transaction_number = int.from_bytes(block[13:15], byteorder="big")
-        print_item("残高", f"{amount} 円")
-        print_item("取引通番", transaction_number)
-        print()
-
-    def print_transaction_history(self) -> None:
-        print_section("取引履歴")
-        blocks = self._read_blocks(4, range(20))
-
-        for index, block in enumerate(blocks):
-            recorded_by = block[0]
-            if recorded_by == 0x00:
-                break
-
-            transaction_type = block[1] & 0x7F
-            pay_type = block[2]
-            gate_instruction_type = block[3]
-            recorded_at = int.from_bytes(block[4:6], byteorder="big")
-
-            self._print_transaction_entry(
-                index,
-                recorded_by,
-                transaction_type,
-                pay_type,
-                gate_instruction_type,
-                recorded_at,
-                block,
-            )
-
-    def print_unknown_blocks(self) -> None:
-        print_section("不明情報1")
-        blocks = self._read_blocks(5, range(10))
-        for block in blocks:
-            print(block.hex())
-
-    def print_commuter_pass_information(self) -> None:
-        print_section("定期情報")
-        primary_block, _, supplemental_block = self._read_blocks(6, range(3))
-
-        start_at = int.from_bytes(primary_block[0:2], byteorder="big")
-        print_item("開始日", format_date(start_at))
-
-        end_at = int.from_bytes(primary_block[2:4], byteorder="big")
-        print_item("終了日", format_date(end_at))
-
-        start_station = self._format_station(primary_block[8], primary_block[9])
-        print_item("始点駅", start_station)
-
-        end_station = self._format_station(primary_block[10], primary_block[11])
-        print_item("終点駅", end_station)
-
-        via1_station = self._format_station(primary_block[12], primary_block[13])
-        print_item("経由駅1", via1_station)
-
-        via2_station = self._format_station(primary_block[14], primary_block[15])
-        print_item("経由駅2", via2_station)
-
-        issued_at = int.from_bytes(supplemental_block[5:7], byteorder="big")
-        print_item("発行日", format_date(issued_at))
-
-    def print_gate_in_out_information(self) -> None:
-        print_section("改札入出場情報")
-        blocks = self._read_blocks(7, range(3))
-
-        for index, block in enumerate(blocks):
-            date = int.from_bytes(block[6:8], byteorder="big")
-            time_hex = block[8:10].hex()
-            print(f"[{index:02}] {format_date(date)} {time_hex[0:2]}:{time_hex[2:4]}")
-
-            gate_in_out_type = gate_in_out_type_to_str(block[0])
-            print_item("改札入出場種別", gate_in_out_type)
-
-            intermadiate_gate_instruction_type = (
-                intermadiate_gate_instruction_type_to_str(block[1])
-            )
-            print_item("中間改札処理種別", intermadiate_gate_instruction_type)
-
-            station_line = block[2]
-            station_order = block[3]
-            print_item("入出場駅", self._format_station(station_line, station_order))
-
-            print_item("装置番号", block[4:6].hex().upper())
-
-            amount = int.from_bytes(block[10:12], byteorder="little")
-            print_item("金額", f"{amount} 円")
-
-            commuter_pass_fee = int.from_bytes(block[12:14], byteorder="little")
-            print_item("最寄定期区間までの運賃", commuter_pass_fee)
-
-            station_line = block[14]
-            station_order = block[15]
-            print_item(
-                "最寄定期区間の駅",
-                self._format_station(station_line, station_order),
-            )
-
-            print()
-
-    def print_sf_gate_in_information(self) -> None:
-        print_section("SF改札入場情報")
-        first_block, second_block = self._read_blocks(8, range(2))
-
-        entry_station_line = first_block[0]
-        entry_station_order = first_block[1]
-        print_item(
-            "入場駅",
-            self._format_station(entry_station_line, entry_station_order),
-        )
-
-        print_item(
-            "料金収受対象中間改札入出場日付",
-            format_date(int.from_bytes(second_block[0:2], byteorder="big")),
-        )
-        entry_time = second_block[2:4].hex()
-        print_item("中間改札入場時刻", f"{entry_time[0:2]}:{entry_time[2:4]}")
-
-        intermadiate_entry_station_line = second_block[4]
-        intermadiate_entry_station_order = second_block[5]
-        print_item(
-            "中間改札入場駅",
-            self._format_station(
-                intermadiate_entry_station_line, intermadiate_entry_station_order
-            ),
-        )
-
-        print_item("不明値1", hex(second_block[6]))
-
-        exit_time = second_block[7:9].hex()
-        print_item("中間改札出場時刻", f"{exit_time[0:2]}:{exit_time[2:4]}")
-
-        intermadiate_exit_station_line = second_block[9]
-        intermadiate_exit_station_order = second_block[10]
-        print_item(
-            "中間改札出場駅",
-            self._format_station(
-                intermadiate_exit_station_line, intermadiate_exit_station_order
-            ),
-        )
-
-        print_item("不明値2", hex(second_block[11]))
+            report = TextReport(self.palette, verbose=self.verbose)
+            print(report.render(card))
 
 
-def on_startup(target: list[RemoteTarget]) -> list[RemoteTarget]:
-    return target
+def on_startup(targets: list[RemoteTarget]) -> list[RemoteTarget]:
+    return targets
 
 
-def on_connect(tag: Tag):
-    if not isinstance(tag, FelicaStandard):
-        return
-
-    station_code_lookup = StationCodeLookup()
-
-    polling_result = tag.polling(SYSTEM_CODE)
-    if len(polling_result) != 2:
-        raise RuntimeError("Polling 応答が不正です。")
-    tag.idm, tag.pmm = polling_result
-
-    client = FelicaRemoteClient(resolve_server_url(), tag)
-    try:
-        auth_result = client.mutual_authentication(
-            SYSTEM_CODE,
-            list(AREA_NODE_IDS),
-            list(SERVICE_NODE_IDS),
-        )
-    except FelicaRemoteClientError as exc:
-        raise RuntimeError(f"Remote authentication failed: {exc}") from exc
-
-    idi_hex = (auth_result.get("issue_id") or auth_result.get("idi") or "").upper()
-    pmi_hex = (
-        auth_result.get("issue_parameter") or auth_result.get("pmi") or ""
-    ).upper()
-
-    if not idi_hex:
-        raise RuntimeError("Server response missing issue_id.")
-    if not pmi_hex:
-        raise RuntimeError("Server response missing issue_parameter.")
-
-    try:
-        idi_bytes = bytes.fromhex(idi_hex)
-    except ValueError as exc:
-        raise RuntimeError("Issue ID is not valid hex.") from exc
-
-    print_section("カード識別")
-    print_item("IDm", client.idm.hex().upper())
-    print_item("PMm", client.pmm.hex().upper())
-    print_item("IDi", idi_bytes_to_str(idi_bytes))
-    print_item("PMi", pmi_hex)
-    print()
-
-    reader = RemoteCardReader(client)
-    reporter = SuicaTagReporter(reader, station_code_lookup)
-    reporter.print_issue_information(leading_newline=False)
-    reporter.print_attribute_information()
-    reporter.print_unknown_information()
-    reporter.print_last_topup_information()
-    reporter.print_transaction_history()
-    # reporter.print_unknown_blocks()
-    reporter.print_commuter_pass_information()
-    reporter.print_gate_in_out_information()
-    reporter.print_sf_gate_in_information()
-
-
-def fix_ic_code_map():
+def fix_ic_code_map() -> None:
     FelicaStandard.IC_CODE_MAP[0x31] = ("RC-S???", 1, 1)
 
 
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="suica-viewer",
+        description="FeliCa 交通系ICカードの詳細情報を読み取って表示します。",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="人間向けの表ではなく JSON を出力する。",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="装置番号・生コードなどの詳細フィールドも表示する。",
+    )
+    parser.add_argument(
+        "--no-color",
+        action="store_true",
+        help="ANSI カラー出力を無効化する（NO_COLOR / 非TTY でも自動的に無効）。",
+    )
+    parser.add_argument(
+        "--server",
+        metavar="URL",
+        default=None,
+        help="認証サーバの URL（未指定なら AUTH_SERVER_URL 環境変数か既定値）。",
+    )
+    return parser.parse_args(argv)
+
+
 def main() -> None:
+    args = parse_args()
     fix_ic_code_map()
+
+    try:
+        runner = CliRunner(args)
+    except Exception as exc:
+        raise SystemExit(f"初期化に失敗しました: {exc}")
 
     # usb1 raises USBError, which does not derive from OSError, so nfcpy's own
     # `except IOError` lets it through and the user sees a bare traceback.
@@ -479,11 +453,13 @@ def main() -> None:
         )
 
     with clf:
+        if not args.json:
+            print("カードをかざしてください。", file=sys.stderr, flush=True)
         clf.connect(
             rdwr={
                 "targets": ["212F", "424F"],  # FeliCa only
                 "on-startup": on_startup,
-                "on-connect": on_connect,
+                "on-connect": runner.on_connect,
             }
         )
 

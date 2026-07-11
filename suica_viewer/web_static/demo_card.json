@@ -1,0 +1,147 @@
+{
+  "system": {
+    "idm_hex": "0113AABBCCDDEEFF",
+    "pmm_hex": "0389FF...",
+    "idi_hex": "0103ABCD...",
+    "idi_display": "JE... display",
+    "pmi": "01234567"
+  },
+  "issue_primary": {
+    "owner_name": "鈴木一郎",
+    "secondary_issue_id": "JEABCD25040112345",
+    "owner_phone_hex": "09012345678FFF00",
+    "owner_age_code": "28",
+    "owner_birthdate": "1990-04-01",
+    "deposit": 500,
+    "issuer_id": "0103 (東日本旅客鉄道株式会社 / JE)",
+    "issuer_id_hex": "0103",
+    "issued_by_code": 8,
+    "issued_by": "自動券売機",
+    "issued_station": "東日本旅客鉄道 東海道線 東京",
+    "issued_at": "2024-04-01",
+    "expires_at": "2034-04-01"
+  },
+  "attribute": {
+    "card_type_code": 2,
+    "card_type": "Suica/PiTaPa/TOICA/PASMO",
+    "region": 2,
+    "balance": 3820,
+    "transaction_number": 184
+  },
+  "last_topup": {
+    "equipment_code": 22,
+    "equipment": "自動改札機",
+    "station": "東日本旅客鉄道 東海道線 新橋",
+    "amount": 3000
+  },
+  "unknown": {
+    "balance": 3988,
+    "date": "2025-07-10",
+    "transaction_number": 183
+  },
+  "transaction_history": [
+    {
+      "index": 0,
+      "recorded_on": "2025-07-11",
+      "recorded_by_code": 22,
+      "recorded_by": "自動改札機",
+      "transaction_type_code": 1,
+      "transaction_type": "自動改札機出場",
+      "pay_type_code": 0,
+      "pay_type": "現金/なし",
+      "gate_instruction_type_code": 2,
+      "gate_instruction_type": "入場/出場",
+      "entry_station": "東日本旅客鉄道 東海道線 東京",
+      "exit_station": "東日本旅客鉄道 東海道線 新橋",
+      "balance": 3820,
+      "transaction_number": 184,
+      "delta": -168
+    },
+    {
+      "index": 1,
+      "recorded_on": "2025-07-10",
+      "recorded_by_code": 20,
+      "recorded_by": "駅務機器(PASMO発行機?)",
+      "transaction_type_code": 2,
+      "transaction_type": "SFチャージ",
+      "pay_type_code": 0,
+      "pay_type": "現金/なし",
+      "gate_instruction_type_code": 2,
+      "gate_instruction_type": "入場/出場",
+      "entry_station": "東日本旅客鉄道 東海道線 新橋",
+      "exit_station": "東日本旅客鉄道 東海道線 新橋",
+      "balance": 3988,
+      "transaction_number": 183,
+      "delta": 3000
+    },
+    {
+      "index": 2,
+      "recorded_on": "2025-07-09",
+      "recorded_by_code": 199,
+      "recorded_by": "物販端末",
+      "transaction_type_code": 70,
+      "transaction_type": "物販",
+      "pay_type_code": 0,
+      "pay_type": "現金/なし",
+      "gate_instruction_type_code": 0,
+      "gate_instruction_type": "未定義",
+      "transaction_time": "10:30:14",
+      "balance": 988,
+      "transaction_number": 182,
+      "delta": -158
+    },
+    {
+      "index": 3,
+      "recorded_on": "2025-07-09",
+      "recorded_by_code": 22,
+      "recorded_by": "自動改札機",
+      "transaction_type_code": 1,
+      "transaction_type": "自動改札機出場",
+      "pay_type_code": 0,
+      "pay_type": "現金/なし",
+      "gate_instruction_type_code": 1,
+      "gate_instruction_type": "入場",
+      "entry_station": "東日本旅客鉄道 東海道線 東京",
+      "exit_station": "不明 (線区コード: 0x00, 駅順コード: 0x00)",
+      "balance": 1146,
+      "transaction_number": 181,
+      "delta": null
+    }
+  ],
+  "commuter": {
+    "valid_from": "2025-04-01",
+    "valid_to": "2025-09-30",
+    "start_station": "東日本旅客鉄道 東海道線 東京",
+    "end_station": "東日本旅客鉄道 東海道線 新橋",
+    "via1_station": "東日本旅客鉄道 東海道線 有楽町",
+    "via2_station": "不明 (線区コード: 0x00, 駅順コード: 0x00)",
+    "issued_at": "2025-03-20"
+  },
+  "gate": [
+    {
+      "index": 0,
+      "date": "2025-07-11",
+      "time": "10:30",
+      "gate_in_out_type_code": 32,
+      "gate_in_out_type": "出場",
+      "intermediate_gate_instruction_type_code": 0,
+      "intermediate_gate_instruction_type": "未定義",
+      "station": "東日本旅客鉄道 東海道線 新橋",
+      "device_id_hex": "1234",
+      "amount": 3820,
+      "commuter_pass_fee": 0,
+      "commuter_station": "東日本旅客鉄道 東海道線 東京"
+    }
+  ],
+  "sf_gate": {
+    "has_record": true,
+    "entry_station": "東日本旅客鉄道 東海道線 東京",
+    "intermediate_entry_date": "2025-07-11",
+    "intermediate_entry_time": "1015",
+    "intermediate_entry_station": "東日本旅客鉄道 東海道線 新橋",
+    "unknown_value1_hex": "0x0",
+    "intermediate_exit_time": "1042",
+    "intermediate_exit_station": "東日本旅客鉄道 東海道線 有楽町",
+    "unknown_value2_hex": "0x0"
+  }
+}
