@@ -19,7 +19,10 @@
         "ms-python.python",
         "ms-python.black-formatter",
         "njpwerner.autodocstring"
-      ]
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/workspace/.venv/bin/python"
+      }
     }
   }
 }
