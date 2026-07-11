@@ -273,6 +273,8 @@ class SuicaGuiApp:
         self.history_tree: ttk.Treeview | None = None
         self.gate_tree: ttk.Treeview | None = None
         self.current_gate_entries: list[dict[str, Any]] = []
+        self.paid_ticket_tree: ttk.Treeview | None = None
+        self.paid_ticket_status_var = tk.StringVar(master=self.root, value="-")
         self.sf_gate_vars = self._create_string_vars(SF_GATE_VAR_KEYS)
         self.commuter_detail_vars = self._create_string_vars(COMMUTER_DETAIL_KEYS)
         self.card_detail_sections = CARD_DETAIL_SECTIONS
@@ -480,7 +482,7 @@ class SuicaGuiApp:
 
     def _configure_tree_tags(self) -> None:
         theme = self.theme
-        for tree in (self.history_tree, self.gate_tree):
+        for tree in (self.history_tree, self.gate_tree, self.paid_ticket_tree):
             if tree is None:
                 continue
             tree.tag_configure("even", background=theme["tree_even"])
@@ -705,12 +707,18 @@ class SuicaGuiApp:
         column_specs: Iterable[TreeColumnSpec],
         *,
         on_sort: Callable[[str], None] | None = None,
+        height: int | None = None,
     ) -> ttk.Treeview:
         specs = list(column_specs)
         column_ids = [spec.heading for spec in specs]
-        tree = ttk.Treeview(
-            parent, columns=column_ids, show="headings", selectmode="browse"
-        )
+        tree_kwargs: dict[str, Any] = {
+            "columns": column_ids,
+            "show": "headings",
+            "selectmode": "browse",
+        }
+        if height is not None:
+            tree_kwargs["height"] = height
+        tree = ttk.Treeview(parent, **tree_kwargs)
         for spec in specs:
             heading_kwargs: dict[str, Any] = {"text": spec.heading}
             if on_sort is not None:
@@ -946,6 +954,36 @@ class SuicaGuiApp:
             wraplength=460,
             padx=(0, 8),
             pady=2,
+        )
+
+        paid_container = self._create_section(
+            frame,
+            "料金発券・改札情報",
+            padding=(8, 8, 8, 8),
+            margin=(0, 12),
+            fill="both",
+        )
+        ttk.Label(
+            paid_container,
+            textvariable=self.paid_ticket_status_var,
+            style="SectionMeta.TLabel",
+        ).pack(anchor="w", pady=(0, 6))
+
+        paid_columns = [
+            TreeColumnSpec("発駅", 200),
+            TreeColumnSpec("着駅", 200),
+            TreeColumnSpec("有効期限", 110),
+            TreeColumnSpec("金額", 100, "e"),
+            TreeColumnSpec("発券時刻", 100, "center"),
+            TreeColumnSpec("発券種別", 90, "center"),
+            TreeColumnSpec("装置番号", 100, "center"),
+            TreeColumnSpec("改札実施駅", 200),
+            TreeColumnSpec("改札実施時刻", 110, "center"),
+        ]
+        self.paid_ticket_tree = self._create_treeview(
+            paid_container,
+            paid_columns,
+            height=3,
         )
 
     def _build_data_tab(self, frame: ttk.Frame) -> None:
@@ -1389,6 +1427,7 @@ class SuicaGuiApp:
         )
         self._populate_history(card_data.transaction_history)
         self._populate_gate_info(card_data.gate, card_data.sf_gate)
+        self._populate_paid_ticket(card_data)
         self._populate_details(card_data)
         self._finalize_card_update()
 
@@ -1503,6 +1542,34 @@ class SuicaGuiApp:
             tag = "odd" if index % 2 else "even"
             self.gate_tree.insert("", tk.END, values=values, tags=(tag,))
 
+    def _populate_paid_ticket(self, card_data: CardData) -> None:
+        if self.paid_ticket_tree is None:
+            return
+
+        entries = card_data.paid_ticket
+        if entries:
+            self.paid_ticket_status_var.set(f"{len(entries)} 件")
+        elif card_data.paid_ticket_available:
+            self.paid_ticket_status_var.set("記録なし")
+        else:
+            self.paid_ticket_status_var.set(card_data.paid_ticket_reason or "—")
+
+        self.paid_ticket_tree.delete(*self.paid_ticket_tree.get_children())
+        for index, entry in enumerate(entries):
+            values = (
+                entry.get("depart_station", "-"),
+                entry.get("arrive_station", "-"),
+                entry.get("expires_at", "-"),
+                _format_currency(entry.get("amount")),
+                entry.get("issued_time", "-"),
+                entry.get("issue_type_hex", "-"),
+                entry.get("device_id_hex", "-"),
+                entry.get("checked_station", "-"),
+                entry.get("checked_time", "-"),
+            )
+            tag = "odd" if index % 2 else "even"
+            self.paid_ticket_tree.insert("", tk.END, values=values, tags=(tag,))
+
     def _populate_history(self, history: list[dict[str, Any]]) -> None:
         self.current_history = history
         self._apply_history_filter()
@@ -1563,6 +1630,10 @@ class SuicaGuiApp:
         self._gate_view = []
         if self.gate_tree is not None:
             self.gate_tree.delete(*self.gate_tree.get_children())
+
+        self.paid_ticket_status_var.set("-")
+        if self.paid_ticket_tree is not None:
+            self.paid_ticket_tree.delete(*self.paid_ticket_tree.get_children())
 
         if self.details_text is not None:
             self.details_text.configure(state=tk.NORMAL)

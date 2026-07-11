@@ -87,6 +87,7 @@ Main output items
 - Attribute information (card type, balance, transaction counter)
 - Transaction history (parses gate entries/exits, purchases, charges; also shows the per-transaction balance change)
 - Commuter pass data, gate entry/exit records, SF gate entry information
+- Paid-ticket / express-gate records (料金発券・改札情報) — probed and read automatically only when the card carries them (service `0x1848`); cards without it, or an auth server lacking that key, are skipped gracefully without affecting the rest
 
 ## Usage (GUI)
 ```bash
@@ -98,7 +99,7 @@ The GUI provides:
 - Overview tab led by a hero card showing the balance prominently, followed by key fields
 - Light/Dark theme toggle in the top-right corner
 - History tab displaying transaction history in a table, with a per-transaction balance-change column (charges highlighted in green), column-header sorting, and full-text filtering via the input box (`Ctrl+F` / `Cmd+F` to focus)
-- Gates tab showing gate history, device numbers, amounts, commuter sections (sortable columns), and SF gate entry data
+- Gates tab showing gate history, device numbers, amounts, commuter sections (sortable columns), SF gate entry data, and paid-ticket / express-gate records when present
 - Data tab for viewing the card information JSON — copy to clipboard, save to a file, or export the transaction history as CSV
 
 ## Usage (Web GUI)

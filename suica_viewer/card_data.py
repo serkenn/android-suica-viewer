@@ -8,7 +8,7 @@ ends render.
 
 import os
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .auth_client import FelicaRemoteClient
@@ -42,6 +42,11 @@ SERVICE_NODE_IDS: tuple[int, ...] = (
     0x108C,
     0x10C8,
 )
+
+# Paid-ticket / express-gate service (料金発券・改札情報). Not present on every
+# card, and reading it needs its own key, so it is probed and authenticated
+# only when the card actually carries it (see CardDataService.collect).
+PAID_TICKET_SERVICE_NODE_ID = 0x1848
 
 READ_COMMAND_CODE = 0x14
 DATA_BLOCK_SIZE = 16
@@ -143,6 +148,9 @@ class CardData:
     commuter: dict[str, Any]
     gate: list[dict[str, Any]]
     sf_gate: dict[str, Any]
+    paid_ticket: list[dict[str, Any]] = field(default_factory=list)
+    paid_ticket_available: bool = False
+    paid_ticket_reason: str | None = None
 
     def to_serializable_dict(self) -> dict[str, Any]:
         return {
@@ -161,6 +169,9 @@ class CardData:
             "commuter": dict(self.commuter),
             "gate": [dict(entry) for entry in self.gate],
             "sf_gate": dict(self.sf_gate),
+            "paid_ticket": [dict(entry) for entry in self.paid_ticket],
+            "paid_ticket_available": self.paid_ticket_available,
+            "paid_ticket_reason": self.paid_ticket_reason,
         }
 
     @property
@@ -414,6 +425,36 @@ class SuicaCardDataExtractor:
             "unknown_value2_hex": hex(second_block[11]),
         }
 
+    def read_paid_ticket_information(self, service_index: int) -> list[dict[str, Any]]:
+        """Parse the 料金発券・改札情報 service (express/paid gate records)."""
+        blocks = self._read_blocks(service_index, range(2))
+        entries: list[dict[str, Any]] = []
+        for index, block in enumerate(blocks):
+            if not any(block):
+                continue
+            entries.append(
+                {
+                    "index": index,
+                    "depart_station": self._format_station(block[0], block[1]),
+                    "arrive_station": self._format_station(block[2], block[3]),
+                    "expires_at": format_date(
+                        int.from_bytes(block[4:6], byteorder="big")
+                    ),
+                    "issued_time": format_time(
+                        int.from_bytes(block[6:8], byteorder="big")
+                    ),
+                    "issue_type_hex": block[8:9].hex().upper(),
+                    # The fee byte stores the amount divided by ten.
+                    "amount": block[9] * 10,
+                    "device_id_hex": block[10:12].hex().upper(),
+                    "checked_station": self._format_station(block[12], block[13]),
+                    "checked_time": format_time(
+                        int.from_bytes(block[14:16], byteorder="big")
+                    ),
+                }
+            )
+        return entries
+
 
 def _annotate_balance_deltas(entries: list[dict[str, Any]]) -> None:
     """Attach the per-transaction balance change to each history entry.
@@ -444,11 +485,35 @@ class CardDataService:
         *,
         progress_callback: ProgressCallback | None = None,
     ) -> CardData:
-        auth_result = client.mutual_authentication(
-            SYSTEM_CODE,
-            list(AREA_NODE_IDS),
-            list(SERVICE_NODE_IDS),
-        )
+        # The paid-ticket service (0x1848) is not on every card and needs its own
+        # key. Probe for it (unencrypted, no server involved) and only fold it
+        # into the authenticated node set when the card actually carries it.
+        paid_present, paid_reason = self._probe_paid_ticket(client)
+        services = list(SERVICE_NODE_IDS)
+        paid_index: int | None = None
+        if paid_present:
+            paid_index = len(services)
+            services.append(PAID_TICKET_SERVICE_NODE_ID)
+
+        try:
+            auth_result = client.mutual_authentication(
+                SYSTEM_CODE, list(AREA_NODE_IDS), services
+            )
+        except Exception:
+            if paid_index is None:
+                raise
+            # The extended authentication failed — most likely the server has no
+            # key for the paid-ticket node. Recover by re-polling and
+            # authenticating the known-good base set so everything else still
+            # reads; the paid-ticket service is skipped with a reason.
+            paid_index = None
+            paid_reason = (
+                "料金発券サービスの認証に失敗しました（サーバに鍵が無い可能性）。"
+            )
+            self._reauthenticate_base(client)
+            auth_result = client.mutual_authentication(
+                SYSTEM_CODE, list(AREA_NODE_IDS), list(SERVICE_NODE_IDS)
+            )
         self._update_progress(progress_callback, 30.0)
 
         system_info = self._build_system_info(client, auth_result)
@@ -478,6 +543,17 @@ class CardDataService:
         self._update_progress(progress_callback, 97.0)
 
         sf_gate_info = extractor.read_sf_gate_in_information()
+        self._update_progress(progress_callback, 97.0)
+
+        paid_ticket: list[dict[str, Any]] = []
+        paid_available = False
+        if paid_index is not None:
+            try:
+                paid_ticket = extractor.read_paid_ticket_information(paid_index)
+                paid_available = True
+                paid_reason = None
+            except Exception as exc:
+                paid_reason = f"料金発券情報の読み取りに失敗しました: {exc}"
         self._update_progress(progress_callback, 100.0)
 
         return CardData(
@@ -490,7 +566,31 @@ class CardDataService:
             commuter=commuter_info,
             gate=gate_info,
             sf_gate=sf_gate_info,
+            paid_ticket=paid_ticket,
+            paid_ticket_available=paid_available,
+            paid_ticket_reason=paid_reason,
         )
+
+    def _probe_paid_ticket(self, client: FelicaRemoteClient) -> tuple[bool, str | None]:
+        """Check (unencrypted) whether the card carries the paid-ticket service."""
+        from nfc.tag.tt3 import ServiceCode
+
+        node = PAID_TICKET_SERVICE_NODE_ID
+        try:
+            versions = client.tag.request_service([ServiceCode(node >> 6, node & 0x3F)])
+        except Exception as exc:
+            return False, f"料金発券サービスの存在確認に失敗しました: {exc}"
+        if not versions or versions[0] == 0xFFFF:
+            return False, "カードに料金発券サービスがありません。"
+        return True, None
+
+    @staticmethod
+    def _reauthenticate_base(client: FelicaRemoteClient) -> None:
+        """Re-poll the card and clear session state before a fresh authentication."""
+        polling_result = client.tag.polling(SYSTEM_CODE)
+        if len(polling_result) == 2:
+            client.tag.idm, client.tag.pmm = polling_result
+        client.reset(client.tag)
 
     def _build_system_info(
         self, client: FelicaRemoteClient, auth_result: dict[str, Any]

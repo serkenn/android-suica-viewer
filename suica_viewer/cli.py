@@ -137,6 +137,7 @@ class TextReport:
         self._commuter_pass(card)
         self._gate_history(card)
         self._sf_gate(card)
+        self._paid_ticket(card)
         return "\n".join(self.lines)
 
     # -- building blocks ---------------------------------------------------- #
@@ -336,6 +337,36 @@ class TextReport:
             pairs.append(("不明値1", sf.get("unknown_value1_hex", "—")))
             pairs.append(("不明値2", sf.get("unknown_value2_hex", "—")))
         self._kv(pairs)
+
+    def _paid_ticket(self, card: CardData) -> None:
+        entries = card.paid_ticket
+        self._section(f"料金発券・改札情報（{len(entries)}件）")
+        if not entries:
+            reason = card.paid_ticket_reason or "（記録なし）"
+            self.lines.append(self.palette.dim(f"  {reason}"))
+            return
+
+        widths = (3, 10, 9, 8)
+        headers = ("No", "有効期限", "金額", "発券時刻", "区間（発→着）")
+        self._table_header(headers, widths)
+        for entry in entries:
+            cells = [
+                fit(str(entry["index"] + 1), widths[0], align="right"),
+                fit(entry.get("expires_at", "—"), widths[1]),
+                fit(_yen_compact(entry.get("amount")), widths[2], align="right"),
+                fit(entry.get("issued_time", "—"), widths[3]),
+                f"{entry.get('depart_station', '—')} → {entry.get('arrive_station', '—')}",
+            ]
+            self.lines.append("  " + "  ".join(cells))
+            if self.verbose:
+                self.lines.append(
+                    self.palette.dim(
+                        f"       発券種別 {entry.get('issue_type_hex', '—')} / "
+                        f"装置番号 {entry.get('device_id_hex', '—')} / "
+                        f"改札実施 {entry.get('checked_station', '—')} "
+                        f"{entry.get('checked_time', '—')}"
+                    )
+                )
 
     def _table_header(self, headers: tuple[str, ...], widths: tuple[int, ...]) -> None:
         cells = []

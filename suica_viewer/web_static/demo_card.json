@@ -143,5 +143,21 @@
     "intermediate_exit_time": "1042",
     "intermediate_exit_station": "東日本旅客鉄道 東海道線 有楽町",
     "unknown_value2_hex": "0x0"
-  }
+  },
+  "paid_ticket": [
+    {
+      "index": 0,
+      "depart_station": "東日本旅客鉄道 東海道線 東京",
+      "arrive_station": "東日本旅客鉄道 東海道線 新橋",
+      "expires_at": "2025-07-11",
+      "issued_time": "19:12:00",
+      "issue_type_hex": "01",
+      "amount": 990,
+      "device_id_hex": "1234",
+      "checked_station": "東日本旅客鉄道 東海道線 有楽町",
+      "checked_time": "19:45:00"
+    }
+  ],
+  "paid_ticket_available": true,
+  "paid_ticket_reason": null
 }

@@ -771,6 +771,48 @@
         renderHistoryTable();
       }
 
+      const PAID_COLS = [
+        { label: "発駅", get: (e) => e.depart_station },
+        { label: "着駅", get: (e) => e.arrive_station },
+        { label: "有効期限", get: (e) => e.expires_at },
+        { label: "金額", num: true, get: (e) => yen(e.amount) },
+        { label: "発券時刻", get: (e) => e.issued_time },
+        { label: "発券種別", get: (e) => e.issue_type_hex },
+        { label: "装置番号", get: (e) => e.device_id_hex },
+        { label: "改札実施駅", get: (e) => e.checked_station },
+        { label: "改札実施時刻", get: (e) => e.checked_time },
+      ];
+
+      function colTable(cols, rows) {
+        const thead = el(
+          "thead",
+          {},
+          el(
+            "tr",
+            {},
+            ...cols.map((col) =>
+              el("th", { class: col.num ? "num" : "", text: col.label }),
+            ),
+          ),
+        );
+        const tbody = el("tbody");
+        for (const e of rows) {
+          tbody.append(
+            el(
+              "tr",
+              {},
+              ...cols.map((col) =>
+                el("td", {
+                  class: col.num ? "num" : "",
+                  text: dash(col.get(e)),
+                }),
+              ),
+            ),
+          );
+        }
+        return el("div", { class: "tablewrap" }, el("table", {}, thead, tbody));
+      }
+
       const GATE_COLS = [
         { label: "日時", get: (e) => `${dash(e.date)} ${e.time || ""}`.trim() },
         { label: "入出場種別", get: (e) => e.gate_in_out_type },
@@ -846,6 +888,20 @@
           );
         } else {
           root.append(emptyCard("SF改札入場情報", "記録なし"));
+        }
+
+        const paid = c.paid_ticket || [];
+        if (paid.length) {
+          root.append(card("料金発券・改札情報", colTable(PAID_COLS, paid)));
+        } else {
+          root.append(
+            emptyCard(
+              "料金発券・改札情報",
+              c.paid_ticket_available
+                ? "記録なし"
+                : c.paid_ticket_reason || "記録なし",
+            ),
+          );
         }
       }
 
