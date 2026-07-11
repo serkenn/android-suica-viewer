@@ -1613,6 +1613,7 @@ def _sort_value(entry: dict[str, Any], key: str, numeric: bool) -> tuple:
 
 def fix_ic_code_map() -> None:
     FelicaStandard.IC_CODE_MAP[0x31] = ("RC-S???", 1, 1)
+    FelicaStandard.IC_CODE_MAP[0x36] = ("RC-S???", 1, 1)
 
 
 def main() -> None:

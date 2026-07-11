@@ -402,6 +402,7 @@ def on_startup(targets: list[RemoteTarget]) -> list[RemoteTarget]:
 
 def fix_ic_code_map() -> None:
     FelicaStandard.IC_CODE_MAP[0x31] = ("RC-S???", 1, 1)
+    FelicaStandard.IC_CODE_MAP[0x36] = ("RC-S???", 1, 1)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
