@@ -16,6 +16,23 @@ Suica Viewer is a tool for retrieving, displaying, and saving detailed informati
 - A libusb-compatible driver bound to the reader — see [Reader Driver Setup](#reader-driver-setup)
 - Internet connectivity for communicating with the remote authentication server
 
+## Android app
+
+An Android rewrite is included under `app/`, implemented with Kotlin + Jetpack Compose.  
+It reads cards via NFC-F and shows:
+
+- IDm / PMm / System Code
+- Balance (`0x008B`)
+- Recent history (`0x090F`, up to 20 entries)
+
+### Build Android APK locally
+
+```bash
+./gradlew assembleRelease
+```
+
+Output: `app/build/outputs/apk/release/app-release-unsigned.apk`
+
 ## Installation
 
 ### Prebuilt executables
@@ -156,7 +173,7 @@ uv run pyinstaller packaging/suica-viewer.spec
 
 The executables land in `dist/`. Build with an interpreter whose Tcl/Tk libraries the linker can resolve: uv's managed CPython ships Tcl/Tk 9, whose shared libraries PyInstaller cannot collect, which would yield a GUI binary that crashes on `import tkinter`. The spec fails the build rather than let that ship. Releases are built on CI with `actions/setup-python` for this reason.
 
-Pushing a `v*` tag runs [`.github/workflows/release.yml`](.github/workflows/release.yml), which builds every platform and attaches the executables to the GitHub release.
+Pushing a `v*` tag runs [`.github/workflows/android-release.yml`](.github/workflows/android-release.yml), which builds the Android APK and uploads `suica-viewer-android-<tag>.apk` to the GitHub release.
 
 ## Author
 
