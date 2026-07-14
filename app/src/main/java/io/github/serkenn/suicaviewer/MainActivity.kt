@@ -84,7 +84,7 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
                 status = "読み取り成功",
                 idmHex = idm.toHex(),
                 pmmHex = pmm.toHex(),
-                systemCodeHex = nfcF.systemCode.toUShort().toString(16).padStart(4, '0').uppercase(),
+                systemCodeHex = nfcF.systemCode.toHex(),
                 balance = balance,
                 transactions = history,
             )
@@ -95,7 +95,9 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
 
     private fun readBalance(nfcF: NfcF, idm: ByteArray): Int? {
         val block = readWithoutEncryption(nfcF, idm, SERVICE_BALANCE, 0) ?: return null
-        return littleEndianUInt16(block[10], block[11])
+        // 属性情報ブロックの SF 残高は offset 11-12（リトルエンディアン）。
+        // 履歴ブロックの残高 offset 10-11 と取り違えないこと。
+        return littleEndianUInt16(block[11], block[12])
     }
 
     private fun readHistory(nfcF: NfcF, idm: ByteArray): List<TransactionRecord> {
