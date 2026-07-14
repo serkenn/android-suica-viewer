@@ -25,6 +25,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.ScrollableTabRow
 import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -43,11 +44,11 @@ import androidx.compose.ui.unit.dp
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun SuicaViewerApp(state: SuicaUiState) {
+fun SuicaViewerApp(state: SuicaUiState, onReset: () -> Unit = {}) {
     MaterialTheme {
         Scaffold(topBar = { TopAppBar(title = { Text("Suica ビューア") }) }) { padding ->
             Column(modifier = Modifier.fillMaxSize().padding(padding)) {
-                StatusHeader(state)
+                StatusHeader(state, onReset)
                 if (state is SuicaUiState.Success) {
                     CardTabs(state.card)
                 }
@@ -57,15 +58,29 @@ fun SuicaViewerApp(state: SuicaUiState) {
 }
 
 @Composable
-private fun StatusHeader(state: SuicaUiState) {
+private fun StatusHeader(state: SuicaUiState, onReset: () -> Unit) {
     val message = when (state) {
         is SuicaUiState.Idle -> "カードをかざしてください"
-        is SuicaUiState.Reading -> "読み取り中… ${state.progress}%"
+        is SuicaUiState.Reading -> "読み取り中…"
         is SuicaUiState.Success -> "読み取り成功"
         is SuicaUiState.Error -> "エラー: ${state.message}"
     }
-    Column(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
-        Text(message, style = MaterialTheme.typography.titleMedium)
+    val canRescan = state is SuicaUiState.Success || state is SuicaUiState.Error
+    Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                message,
+                style = MaterialTheme.typography.titleMedium,
+                modifier = Modifier.weight(1f),
+            )
+            if (canRescan) {
+                TextButton(onClick = onReset) { Text("再読み込み") }
+            }
+        }
         if (state is SuicaUiState.Reading) {
             Spacer(Modifier.height(8.dp))
             LinearProgressIndicator(modifier = Modifier.fillMaxWidth())

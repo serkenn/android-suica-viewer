@@ -9,6 +9,7 @@ import androidx.activity.compose.setContent
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Suica viewer host. Uses NFC reader mode to poll a FeliCa card, relays the
@@ -20,6 +21,12 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
     private var nfcAdapter: NfcAdapter? = null
     private var stationLookup: StationCodeLookup? = null
 
+    // Reader mode re-dispatches onTagDiscovered continuously while a card stays
+    // in the field. Guard against overlapping reads, and skip a card we already
+    // handled so the UI stops looping and stays interactive.
+    private val reading = AtomicBoolean(false)
+    @Volatile private var lastIdmHex: String? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         nfcAdapter = NfcAdapter.getDefaultAdapter(this)
@@ -28,7 +35,13 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
         } catch (e: Exception) {
             uiState = SuicaUiState.Error("駅データの読み込みに失敗しました: ${e.message}")
         }
-        setContent { SuicaViewerApp(uiState) }
+        setContent { SuicaViewerApp(uiState, onReset = ::resetForRescan) }
+    }
+
+    /** Clear the last-read card so the next tap (or the card still held) re-reads. */
+    private fun resetForRescan() {
+        lastIdmHex = null
+        uiState = SuicaUiState.Idle
     }
 
     override fun onResume() {
@@ -52,32 +65,46 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
     }
 
     override fun onTagDiscovered(tag: Tag) {
-        val lookup = stationLookup
-        if (lookup == null) {
-            setState(SuicaUiState.Error("駅データが利用できません。"))
-            return
-        }
-        val nfcF = NfcF.get(tag)
-        if (nfcF == null) {
-            setState(SuicaUiState.Error("NFC-F カードではありません。"))
-            return
-        }
+        val idmHex = tag.id.toHexUpper()
+        // Already handled this card (or it is still on the reader): do nothing so
+        // the result stays on screen and remains touchable.
+        if (idmHex == lastIdmHex) return
+        // A read is already running: ignore re-dispatches until it finishes.
+        if (!reading.compareAndSet(false, true)) return
 
-        setState(SuicaUiState.Reading(0))
         try {
-            nfcF.connect()
-            nfcF.timeout = 1000
-            val idm = nfcF.tag.id
-            val pmm = nfcF.manufacturer
-            val reader = SuicaCardReader(DEFAULT_AUTH_SERVER_URL, idm, pmm, lookup) { frame ->
-                nfcF.transceive(frame)
+            val lookup = stationLookup
+            if (lookup == null) {
+                setState(SuicaUiState.Error("駅データが利用できません。"))
+                return
             }
-            val card = reader.collect { progress -> setState(SuicaUiState.Reading(progress)) }
-            setState(SuicaUiState.Success(card))
-        } catch (e: Exception) {
-            setState(SuicaUiState.Error(e.message ?: "カード読み取りに失敗しました。"))
+            val nfcF = NfcF.get(tag)
+            if (nfcF == null) {
+                setState(SuicaUiState.Error("NFC-F カードではありません。"))
+                return
+            }
+
+            setState(SuicaUiState.Reading(0))
+            try {
+                nfcF.connect()
+                nfcF.timeout = 1000
+                val idm = nfcF.tag.id
+                val pmm = nfcF.manufacturer
+                val reader = SuicaCardReader(DEFAULT_AUTH_SERVER_URL, idm, pmm, lookup) { frame ->
+                    nfcF.transceive(frame)
+                }
+                val card = reader.collect { progress -> setState(SuicaUiState.Reading(progress)) }
+                setState(SuicaUiState.Success(card))
+            } catch (e: Exception) {
+                setState(SuicaUiState.Error(e.message ?: "カード読み取りに失敗しました。"))
+            } finally {
+                runCatching { nfcF.close() }
+            }
         } finally {
-            runCatching { nfcF.close() }
+            // Mark this card as handled (success or failure) so it does not loop.
+            // "再読み込み" clears this to allow a deliberate re-read.
+            lastIdmHex = idmHex
+            reading.set(false)
         }
     }
 
