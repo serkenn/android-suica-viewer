@@ -12,14 +12,33 @@ android {
         applicationId = "io.github.serkenn.suicaviewer"
         minSdk = 26
         targetSdk = 35
-        versionCode = 2
-        versionName = "1.0.1"
+        versionCode = 3
+        versionName = "1.0.2"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    // Release signing is driven by environment variables so the keystore never
+    // lives in the repo. On CI they come from GitHub Secrets; locally they are
+    // absent, in which case the release build stays unsigned (debug builds are
+    // unaffected and keep using the default debug keystore).
+    val keystorePath = System.getenv("ANDROID_KEYSTORE_PATH")
+    val releaseSigning = if (keystorePath != null) {
+        signingConfigs.create("release") {
+            storeFile = file(keystorePath)
+            storePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
+            keyAlias = System.getenv("ANDROID_KEY_ALIAS")
+            // The PKCS12 keystore uses a single password for the store and key.
+            keyPassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
+            storeType = "PKCS12"
+        }
+    } else {
+        null
+    }
+
     buildTypes {
         release {
+            signingConfig = releaseSigning
             isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
