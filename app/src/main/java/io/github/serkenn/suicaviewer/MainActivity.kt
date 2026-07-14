@@ -169,6 +169,7 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
     private fun ByteArray.toHex(): String = joinToString("") { "%02X".format(it) }
 }
 
+@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 @androidx.compose.runtime.Composable
 private fun SuicaViewerScreen(snapshot: SuicaSnapshot) {
     Scaffold(topBar = { TopAppBar(title = { Text("Suica Viewer (Android)") }) }) { padding ->
