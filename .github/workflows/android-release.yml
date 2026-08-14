@@ -69,6 +69,12 @@ jobs:
           path: assets
           merge-multiple: true
 
+      - name: Generate checksums
+        working-directory: assets
+        run: |
+          sha256sum * > "$RUNNER_TEMP/SHA256SUMS.txt"
+          mv "$RUNNER_TEMP/SHA256SUMS.txt" .
+
       - name: Publish release asset
         env:
           GH_TOKEN: ${{ github.token }}

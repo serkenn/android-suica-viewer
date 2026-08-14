@@ -3,9 +3,9 @@ package io.github.serkenn.suicaviewer
 import java.time.LocalDate
 
 /**
- * Label maps and formatting helpers ported from the desktop app's
- * `suica_viewer/utils.py`. Kept byte-for-byte compatible so the Android
- * viewer renders exactly the same values as the reference implementation.
+ * Label maps and formatting helpers ported from the upstream viewer's `utils`
+ * module. Kept byte-for-byte compatible so this viewer renders exactly the same
+ * values as the reference implementation.
  */
 
 const val SYSTEM_CODE = 0x0003

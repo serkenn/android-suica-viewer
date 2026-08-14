@@ -5,10 +5,10 @@ import java.io.BufferedReader
 import java.io.InputStreamReader
 
 /**
- * Station lookup ported from `suica_viewer/station_code_lookup.py`.
+ * Station lookup ported from the upstream viewer's `station_codes` module.
  *
  * Indexes `station_codes.csv` by (line code, station order code) as normalized
- * uppercase hex — matching the desktop app's `_normalize_hex_code` (int →
+ * uppercase hex — matching upstream's normalization (int →
  * `Integer.toHexString().uppercase()`, i.e. no zero padding).
  */
 class StationCodeLookup private constructor(
