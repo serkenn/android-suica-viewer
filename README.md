@@ -19,11 +19,27 @@ Suica Viewer is a tool for retrieving, displaying, and saving detailed informati
 ## Android app
 
 An Android rewrite is included under `app/`, implemented with Kotlin + Jetpack Compose.  
-It reads cards via NFC-F and shows:
+It reads cards via NFC-F and decodes the same fields as the desktop viewer:
 
-- IDm / PMm / System Code
-- Balance (`0x008B`)
-- Recent history (`0x090F`, up to 20 entries)
+- Card identity (IDm / PMm / IDi / PMi) and issuer
+- Issuance info, including the collected (invalidated) card flag
+- Balance, attribute flags (voice guidance, SF use outside the commuter period, Touch de Go)
+- Transaction history (up to 20 entries) with per-entry balance deltas
+- Commuter pass details: route, pass number, sale price, purchase payment method, R number
+- Auto-charge contract, threshold and amount
+- Gate entry/exit records, SF gate records and paid-ticket records
+- Copy or share the whole card as JSON
+
+The auth server only takes part in the mutual authentication: once it returns the
+session material the app reads every block from the card itself, so card contents
+never cross the network.
+
+### Auth server setting
+
+The app ships with `https://felica-auth.nyaa.ws` as its default authentication
+server. Tap **設定** in the app bar to point it at another one — for example your
+own instance. The value is stored on the device; saving an empty field restores
+the default.
 
 ### Build Android APK locally
 

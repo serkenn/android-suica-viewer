@@ -82,12 +82,6 @@ val GATE_INSTRUCTION_TYPES: Map<Int, String> = mapOf(
     0x21 to "入場/出場(バス等乗継割引)",
 )
 
-val CARD_TYPE_LABELS: Map<Int, String> = mapOf(
-    0 to "せたまる/IruCa",
-    2 to "Suica/PiTaPa/TOICA/PASMO",
-    3 to "ICOCA",
-)
-
 val ISSUER_ID_MAP: Map<String, Pair<String, String>> = mapOf(
     "0102" to ("北海道旅客鉄道株式会社" to "JH"),
     "0103" to ("東日本旅客鉄道株式会社" to "JE"),
@@ -133,6 +127,13 @@ fun transactionTypeToStr(transactionType: Int): String =
 
 fun payTypeToStr(payType: Int): String =
     lookupByMapping(PAY_TYPES, payType, "支払種別")
+
+/**
+ * 定期券・企画券の購入支払種別。取引履歴の支払種別と同じコード体系だが、
+ * 0x3F は「クレジットカード」の意味で使われる。
+ */
+fun purchasePayTypeToStr(code: Int): String =
+    if (code == 0x3F) "クレジットカード" else payTypeToStr(code)
 
 fun gateInstructionTypeToStr(code: Int): String =
     lookupByMapping(GATE_INSTRUCTION_TYPES, code, "改札処理種別")
@@ -184,8 +185,6 @@ fun formatTime(value: Int): String {
 }
 
 fun formatYen(value: Int): String = "%,d 円".format(value)
-
-fun formatRegion(regionCode: Int): String = "$regionCode (0x%02X)".format(regionCode)
 
 fun issuerIdToStr(issuerIdHex: String): String {
     val key = issuerIdHex.uppercase()

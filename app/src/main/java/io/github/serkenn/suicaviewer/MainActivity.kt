@@ -13,13 +13,18 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Suica viewer host. Uses NFC reader mode to poll a FeliCa card, relays the
- * mutual-authentication and read exchanges through the remote crypto server
- * (see [SuicaCardReader]), and renders the same fields as the desktop app.
+ * mutual authentication through the remote crypto server and then reads the
+ * card locally over the secure session it establishes (see [SuicaCardReader]),
+ * rendering the same fields as the desktop app.
  */
 class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
     private var uiState by mutableStateOf<SuicaUiState>(SuicaUiState.Idle)
     private var nfcAdapter: NfcAdapter? = null
     private var stationLookup: StationCodeLookup? = null
+
+    // The authentication server is a fixed default the user can change; it is
+    // read here on every tap so an edit takes effect on the next card.
+    private var serverUrl by mutableStateOf(DEFAULT_AUTH_SERVER_URL)
 
     // Reader mode re-dispatches onTagDiscovered continuously while a card stays
     // in the field. Guard against overlapping reads, and skip a card we already
@@ -30,12 +35,31 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         nfcAdapter = NfcAdapter.getDefaultAdapter(this)
+        serverUrl = AuthServerSettings.load(this)
         try {
             stationLookup = StationCodeLookup.fromAssets(this)
         } catch (e: Exception) {
             uiState = SuicaUiState.Error("駅データの読み込みに失敗しました: ${e.message}")
         }
-        setContent { SuicaViewerApp(uiState, onReset = ::resetForRescan) }
+        setContent {
+            SuicaViewerApp(
+                state = uiState,
+                serverUrl = serverUrl,
+                onReset = ::resetForRescan,
+                onServerUrlChange = ::updateServerUrl,
+            )
+        }
+    }
+
+    /**
+     * Stores a new authentication server. Returns the error to show, or null on
+     * success; an empty [url] restores the built-in default.
+     */
+    private fun updateServerUrl(url: String): String? = try {
+        serverUrl = AuthServerSettings.save(this, url)
+        null
+    } catch (e: Exception) {
+        e.message ?: "認証サーバの URL が不正です。"
     }
 
     /** Clear the last-read card so the next tap (or the card still held) re-reads. */
@@ -90,7 +114,7 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
                 nfcF.timeout = 1000
                 val idm = nfcF.tag.id
                 val pmm = nfcF.manufacturer
-                val reader = SuicaCardReader(DEFAULT_AUTH_SERVER_URL, idm, pmm, lookup) { frame ->
+                val reader = SuicaCardReader(serverUrl, idm, pmm, lookup) { frame ->
                     nfcF.transceive(frame)
                 }
                 val card = reader.collect { progress -> setState(SuicaUiState.Reading(progress)) }

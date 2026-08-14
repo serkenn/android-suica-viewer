@@ -15,6 +15,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.LinearProgressIndicator
@@ -44,21 +45,98 @@ import androidx.compose.ui.unit.dp
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun SuicaViewerApp(state: SuicaUiState, onReset: () -> Unit = {}) {
+fun SuicaViewerApp(
+    state: SuicaUiState,
+    serverUrl: String = DEFAULT_AUTH_SERVER_URL,
+    onReset: () -> Unit = {},
+    /** Stores a new server URL; returns an error message, or null on success. */
+    onServerUrlChange: (String) -> String? = { null },
+) {
+    var settingsOpen by remember { mutableStateOf(false) }
     MaterialTheme {
-        Scaffold(topBar = { TopAppBar(title = { Text("Suica ビューア") }) }) { padding ->
+        Scaffold(
+            topBar = {
+                TopAppBar(
+                    title = { Text("Suica ビューア") },
+                    actions = {
+                        TextButton(onClick = { settingsOpen = true }) { Text("設定") }
+                    },
+                )
+            },
+        ) { padding ->
             Column(modifier = Modifier.fillMaxSize().padding(padding)) {
-                StatusHeader(state, onReset)
+                StatusHeader(state, serverUrl, onReset)
                 if (state is SuicaUiState.Success) {
                     CardTabs(state.card)
                 }
             }
         }
+        if (settingsOpen) {
+            ServerSettingsDialog(
+                serverUrl = serverUrl,
+                onDismiss = { settingsOpen = false },
+                onSave = onServerUrlChange,
+            )
+        }
     }
 }
 
+/** Lets the user point the app at a different authentication server. */
 @Composable
-private fun StatusHeader(state: SuicaUiState, onReset: () -> Unit) {
+private fun ServerSettingsDialog(
+    serverUrl: String,
+    onDismiss: () -> Unit,
+    onSave: (String) -> String?,
+) {
+    var draft by remember { mutableStateOf(serverUrl) }
+    var error by remember { mutableStateOf<String?>(null) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("認証サーバ") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    "相互認証に使うサーバの URL です。空欄で保存すると既定値に戻ります。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                OutlinedTextField(
+                    value = draft,
+                    onValueChange = { draft = it; error = null },
+                    label = { Text("サーバ URL") },
+                    singleLine = true,
+                    isError = error != null,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Text(
+                    "既定値: $DEFAULT_AUTH_SERVER_URL",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                error?.let {
+                    Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                val message = onSave(draft)
+                if (message == null) onDismiss() else error = message
+            }) { Text("保存") }
+        },
+        dismissButton = {
+            Row {
+                TextButton(onClick = { draft = DEFAULT_AUTH_SERVER_URL; error = null }) {
+                    Text("既定値")
+                }
+                TextButton(onClick = onDismiss) { Text("キャンセル") }
+            }
+        },
+    )
+}
+
+@Composable
+private fun StatusHeader(state: SuicaUiState, serverUrl: String, onReset: () -> Unit) {
     val message = when (state) {
         is SuicaUiState.Idle -> "カードをかざしてください"
         is SuicaUiState.Reading -> "読み取り中…"
@@ -84,6 +162,13 @@ private fun StatusHeader(state: SuicaUiState, onReset: () -> Unit) {
         if (state is SuicaUiState.Reading) {
             Spacer(Modifier.height(8.dp))
             LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+        }
+        if (state is SuicaUiState.Idle || state is SuicaUiState.Error) {
+            Text(
+                "認証サーバ: $serverUrl",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
     }
 }
@@ -120,7 +205,7 @@ private fun OverviewTab(card: CardData) = ScrollColumn {
         LabeledRow("PMm", card.system.pmmHex, mono = true)
         LabeledRow("IDi", card.system.idiDisplay, mono = true)
         LabeledRow("PMi", card.system.pmi, mono = true)
-        LabeledRow("カード種別", card.attribute.cardType)
+        LabeledRow("発行者", card.issuePrimary.issuerId)
     }
     Section("利用サマリ") {
         LabeledRow("残高", formatYen(card.attribute.balance))
@@ -131,6 +216,7 @@ private fun OverviewTab(card: CardData) = ScrollColumn {
         LabeledRow("発行日", card.issuePrimary.issuedAt)
         LabeledRow("有効期限", card.issuePrimary.expiresAt)
         LabeledRow("発行駅", card.issuePrimary.issuedStation)
+        LabeledRow("取り込み済み", collectedLabel(card.issuePrimary.collected))
     }
     Section("定期券ハイライト") {
         if (card.commuter.hasCommuterPass) {
@@ -158,6 +244,7 @@ private fun CardInfoTab(card: CardData) = ScrollColumn {
         LabeledRow("発行駅", issue.issuedStation)
         LabeledRow("発行日", issue.issuedAt)
         LabeledRow("有効期限", issue.expiresAt)
+        LabeledRow("取り込み済み", collectedLabel(issue.collected))
     }
     Section("最終チャージ情報") {
         LabeledRow("チャージ機器", card.lastTopup.equipment)
@@ -165,22 +252,49 @@ private fun CardInfoTab(card: CardData) = ScrollColumn {
         LabeledRow("チャージ金額", formatYen(card.lastTopup.amount))
     }
     Section("カード属性") {
-        LabeledRow("カード種別", card.attribute.cardType)
-        LabeledRow("地域", formatRegion(card.attribute.region))
-        LabeledRow("残高", formatYen(card.attribute.balance))
-        LabeledRow("取引通番", card.attribute.transactionNumber.toString())
+        val a = card.attribute
+        LabeledRow("残高", formatYen(a.balance))
+        LabeledRow("取引通番", a.transactionNumber.toString())
+        LabeledRow("音声案内サービス", usageLabel(a.voiceGuidance))
+        LabeledRow("定期有効期間外のSF利用", usageLabel(a.sfOutsideCommuter))
+        LabeledRow("タッチでGo！新幹線", usageLabel(a.touchDeGo))
     }
     Section("定期券情報") {
         val c = card.commuter
-        LabeledRow("開始日", c.validFrom)
-        LabeledRow("終了日", c.validTo)
-        LabeledRow("始点駅", c.startStation)
-        LabeledRow("終点駅", c.endStation)
-        LabeledRow("経由駅1", c.via1Station)
-        LabeledRow("経由駅2", c.via2Station)
-        LabeledRow("発行日", c.issuedAt)
+        if (!c.hasCommuterPass) {
+            Text("定期券なし", color = MaterialTheme.colorScheme.onSurfaceVariant)
+        } else {
+            LabeledRow("発行事業者", c.issuerId)
+            LabeledRow("開始日", c.validFrom)
+            LabeledRow("終了日", c.validTo)
+            LabeledRow("始点駅", c.startStation)
+            LabeledRow("終点駅", c.endStation)
+            LabeledRow("経由駅1", c.via1Station)
+            LabeledRow("経由駅2", c.via2Station)
+            LabeledRow("券番", c.passNumber, mono = true)
+            LabeledRow("発売額", formatYen(c.salePrice))
+            LabeledRow("購入時支払方法", c.purchasePayType)
+            LabeledRow("R通番", c.rNumber, mono = true)
+            LabeledRow("発行日", c.issuedAt)
+            if (c.commuterCertificateExpiry.isNotEmpty() && c.commuterCertificateExpiry != "—") {
+                LabeledRow("通学証明書省略期限", c.commuterCertificateExpiry)
+            }
+        }
+    }
+    Section("オートチャージ") {
+        val ac = card.autoCharge
+        LabeledRow("契約", if (ac.contracted) "有" else "無")
+        LabeledRow("有効", if (ac.enabled) "有" else "無")
+        if (ac.contracted) {
+            LabeledRow("チャージ額", formatYen(ac.chargeAmount))
+            LabeledRow("しきい値", formatYen(ac.threshold))
+        }
     }
 }
+
+private fun collectedLabel(collected: Boolean) = if (collected) "はい（無効カード）" else "いいえ"
+
+private fun usageLabel(enabled: Boolean) = if (enabled) "利用する" else "利用しない"
 
 @Composable
 private fun HistoryTab(card: CardData) {

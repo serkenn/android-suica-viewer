@@ -5,7 +5,7 @@ import org.json.JSONObject
 import java.nio.charset.Charset
 
 /**
- * Card reading and parsing ported from `suica_viewer/card_data.py`.
+ * Card reading and parsing ported from the desktop viewer's `card_data`.
  *
  * All byte offsets and service/area node ids are kept identical to the desktop
  * implementation so the Android viewer decodes exactly the same fields.
@@ -13,11 +13,50 @@ import java.nio.charset.Charset
 
 const val DEFAULT_AUTH_SERVER_URL = "https://felica-auth.nyaa.ws"
 
+/**
+ * Area nodes covered by the authentication. Areas take part in the key
+ * derivation without widening data access.
+ */
 private val AREA_NODE_IDS: List<Int> = listOf(0x0000, 0x0040, 0x0800, 0x0FC0, 0x1000)
+
+/**
+ * Services authenticated for a read, as the read-only variant of each.
+ *
+ * A viewer never writes, so naming the read-only code means the session key
+ * this earns cannot modify the card — and it is what lets an auth server
+ * running in read-only mode authenticate the request at all.
+ *
+ * The order is not cosmetic: FeliCa requires every key-requiring node to be
+ * listed before any key-free one, so the keyed services come first. Address a
+ * service by the `*_SERVICE` index below rather than by position.
+ */
 private val SERVICE_NODE_IDS: List<Int> = listOf(
-    0x0048, 0x0088, 0x0810, 0x08C8, 0x090C, 0x1008, 0x1048, 0x108C, 0x10C8,
+    // Key-requiring (Random/Purse read-only with key).
+    0x004A, // 発行情報
+    0x0816, // その他（用途未確定）
+    0x08CA, // 最終チャージ情報
+    0x100A, // 拡張情報（定期券番・定期発売額・オートチャージ等）
+    0x104A, // 定期情報
+    // Key-free (Random/Cyclic read-only without key).
+    0x008B, // 属性情報
+    0x090F, // 取引履歴
+    0x108F, // 改札入出場情報
+    0x10CB, // SF改札入場情報
 )
-private const val PAID_TICKET_SERVICE_NODE_ID = 0x1848
+
+/** Where each service sits in [SERVICE_NODE_IDS]; a read addresses it by index. */
+private const val ISSUE_SERVICE = 0
+private const val MISC_SERVICE = 1
+private const val TOPUP_SERVICE = 2
+private const val EXTENDED_SERVICE = 3
+private const val COMMUTER_SERVICE = 4
+private const val ATTRIBUTE_SERVICE = 5
+private const val HISTORY_SERVICE = 6
+private const val GATE_SERVICE = 7
+private const val SF_GATE_SERVICE = 8
+
+/** 料金発券・改札情報 (read-only). Not on every card, so it is probed first. */
+private const val PAID_TICKET_SERVICE_NODE_ID = 0x184B
 
 private const val READ_COMMAND_CODE = 0x14
 private const val DATA_BLOCK_SIZE = 16
@@ -25,6 +64,12 @@ private const val MAX_BLOCKS_PER_REQUEST = 9
 
 // Purchase (物販) transactions store a clock instead of entry/exit stations.
 private const val PURCHASE_TRANSACTION_TYPE = 0x46
+
+/**
+ * Bit 6 of byte 9 in the 発行情報 metadata block marks the card as collected
+ * (取り込み済み), which also makes it invalid for further use.
+ */
+private const val COLLECTED_FLAG_MASK = 1 shl 6
 
 private val SHIFT_JIS: Charset = Charset.forName("Shift_JIS")
 
@@ -50,14 +95,19 @@ data class IssuePrimary(
     val issuedStation: String,
     val issuedAt: String,
     val expiresAt: String,
+    /**
+     * 取り込み済み（無効）フラグ。改札機などがカードを回収した時点で立ち、
+     * 以降そのカードは無効として扱われる。
+     */
+    val collected: Boolean,
 )
 
 data class Attribute(
-    val cardTypeCode: Int,
-    val cardType: String,
-    val region: Int,
     val balance: Int,
     val transactionNumber: Int,
+    val voiceGuidance: Boolean,
+    val sfOutsideCommuter: Boolean,
+    val touchDeGo: Boolean,
 )
 
 data class UnknownInfo(
@@ -93,6 +143,8 @@ data class TransactionEntry(
 )
 
 data class Commuter(
+    val issuerId: String,
+    val issuerIdHex: String,
     val validFrom: String,
     val validTo: String,
     val startStation: String,
@@ -100,6 +152,13 @@ data class Commuter(
     val via1Station: String,
     val via2Station: String,
     val issuedAt: String,
+    val passNumber: String,
+    val rNumber: String,
+    val salePrice: Int,
+    val purchasePayTypeCode: Int,
+    val purchasePayType: String,
+    /** 通学証明書省略期限。学生定期のみ。非該当時は `"—"`。 */
+    val commuterCertificateExpiry: String,
 ) {
     val hasCommuterPass: Boolean
         get() = validFrom.isNotEmpty() && validFrom != "—"
@@ -132,6 +191,13 @@ data class SfGate(
     val unknownValue2Hex: String,
 )
 
+data class AutoCharge(
+    val contracted: Boolean,
+    val enabled: Boolean,
+    val chargeAmount: Int,
+    val threshold: Int,
+)
+
 data class PaidTicket(
     val index: Int,
     val departStation: String,
@@ -153,6 +219,7 @@ data class CardData(
     val unknown: UnknownInfo,
     val transactionHistory: List<TransactionEntry>,
     val commuter: Commuter,
+    val autoCharge: AutoCharge,
     val gate: List<GateEntry>,
     val sfGate: SfGate,
     val paidTicket: List<PaidTicket>,
@@ -162,8 +229,8 @@ data class CardData(
     fun toJson(): JSONObject = buildCardDataJson(this)
 }
 
-/** Issues encrypted read commands through the remote server. */
-private class RemoteCardReader(private val client: RemoteAuthClient) {
+/** Issues encrypted Read commands straight to the card over the secure session. */
+private class SecureCardReader(private val channel: SecureCardChannel) {
     fun readBlocks(serviceIndex: Int, indexes: List<Int>): List<ByteArray> {
         val blocks = ArrayList<ByteArray>()
         var start = 0
@@ -187,8 +254,8 @@ private class RemoteCardReader(private val client: RemoteAuthClient) {
             payload.add((block and 0xFF).toByte())
         }
 
-        val response = client.encryptionExchange(READ_COMMAND_CODE, payload.toByteArray())
-        if (response.size < 3) throw FelicaRemoteClientError("リモートサーバーからの応答が不正です。")
+        val response = channel.exchange(READ_COMMAND_CODE, payload.toByteArray())
+        if (response.size < 3) throw FelicaRemoteClientError("カードからの応答が不正です。")
 
         val statusFlag1 = response.u(0)
         val statusFlag2 = response.u(1)
@@ -209,7 +276,7 @@ private class RemoteCardReader(private val client: RemoteAuthClient) {
 
 /** Extracts structured data from a Suica FeliCa tag via the remote reader. */
 private class SuicaCardDataExtractor(
-    private val reader: RemoteCardReader,
+    private val reader: SecureCardReader,
     private val stations: StationCodeLookup,
 ) {
     private fun station(line: Int, order: Int) = stations.formatStation(line, order)
@@ -217,14 +284,11 @@ private class SuicaCardDataExtractor(
     private fun readSingle(serviceIndex: Int, index: Int) = reader.readBlocks(serviceIndex, listOf(index))[0]
 
     fun readIssueInformationPrimary(): IssuePrimary {
-        val (owner, personal, secondaryIdi, metadata) = readBlocks(0, 4).let {
+        val (owner, personal, secondaryIdi, metadata) = readBlocks(ISSUE_SERVICE, 4).let {
             listOf(it[0], it[1], it[2], it[3])
         }
-        val ownerName = try {
-            String(owner, SHIFT_JIS).trimEnd()
-        } catch (_: Exception) {
-            String(owner, SHIFT_JIS).trimEnd()
-        }
+        // The name field is fixed-width, so it arrives padded with spaces or NULs.
+        val ownerName = String(owner, SHIFT_JIS).trimEnd { it == '\u0000' || it.isWhitespace() }
         return IssuePrimary(
             ownerName = ownerName,
             secondaryIssueId = idiBytesToStr(secondaryIdi),
@@ -239,23 +303,24 @@ private class SuicaCardDataExtractor(
             issuedStation = station(metadata.u(3), metadata.u(4)),
             issuedAt = formatDate(metadata.beInt(7, 9)),
             expiresAt = formatDate(metadata.beInt(14, 16)),
+            collected = (metadata.u(9) and COLLECTED_FLAG_MASK) != 0,
         )
     }
 
     fun readAttributeInformation(): Attribute {
-        val block = readSingle(1, 0)
-        val cardTypeCode = block.u(8) shr 4
+        val block = readSingle(ATTRIBUTE_SERVICE, 0)
+        val settings = block.u(8)
         return Attribute(
-            cardTypeCode = cardTypeCode,
-            cardType = CARD_TYPE_LABELS[cardTypeCode] ?: "不明",
-            region = block.u(8) and 0x0F,
             balance = block.leInt(11, 13),
             transactionNumber = block.beInt(14, 16),
+            voiceGuidance = (settings and 0x10) != 0,
+            sfOutsideCommuter = (settings and 0x20) != 0,
+            touchDeGo = (settings and 0x04) != 0,
         )
     }
 
     fun readUnknownInformation(): UnknownInfo {
-        val block = readSingle(2, 0)
+        val block = readSingle(MISC_SERVICE, 0)
         return UnknownInfo(
             balance = block.leInt(0, 2),
             date = formatDate(block.beInt(8, 10)),
@@ -264,7 +329,7 @@ private class SuicaCardDataExtractor(
     }
 
     fun readLastTopupInformation(): LastTopup {
-        val detail = readBlocks(3, 3)[0]
+        val detail = readBlocks(TOPUP_SERVICE, 3)[0]
         return LastTopup(
             equipmentCode = detail.u(0),
             equipment = equipmentTypeToStr(detail.u(0)),
@@ -274,7 +339,7 @@ private class SuicaCardDataExtractor(
     }
 
     fun readTransactionHistory(): List<TransactionEntry> {
-        val blocks = readBlocks(4, 20)
+        val blocks = readBlocks(HISTORY_SERVICE, 20)
         val entries = ArrayList<TransactionEntry>()
         for ((index, block) in blocks.withIndex()) {
             val recordedBy = block.u(0)
@@ -315,11 +380,18 @@ private class SuicaCardDataExtractor(
         return entries
     }
 
-    fun readCommuterPassInformation(): Commuter {
-        val blocks = readBlocks(6, 3)
+    /** 拡張情報 (0x100A): commuter pass extras and the auto-charge settings. */
+    fun readExtendedInformation(): List<ByteArray> = readBlocks(EXTENDED_SERVICE, 10)
+
+    fun readCommuterPassInformation(extended: List<ByteArray>): Commuter {
+        val blocks = readBlocks(COMMUTER_SERVICE, 3)
         val primary = blocks[0]
         val supplemental = blocks[2]
+        val issuerIdHex = extended[0].hexUpper(0, 2)
+        val passNumberBytes = byteArrayOf(extended[0][15], extended[1][0], extended[1][1])
         return Commuter(
+            issuerId = issuerIdToStr(issuerIdHex),
+            issuerIdHex = issuerIdHex,
             validFrom = formatDate(primary.beInt(0, 2)),
             validTo = formatDate(primary.beInt(2, 4)),
             startStation = station(primary.u(8), primary.u(9)),
@@ -327,11 +399,28 @@ private class SuicaCardDataExtractor(
             via1Station = station(primary.u(12), primary.u(13)),
             via2Station = station(primary.u(14), primary.u(15)),
             issuedAt = formatDate(supplemental.beInt(5, 7)),
+            passNumber = decodeBcd(passNumberBytes),
+            // The R number is stored one digit wider than it is printed.
+            rNumber = decodeBcd(extended[1].copyOfRange(10, 12)).drop(1),
+            salePrice = extended[1].leInt(7, 10),
+            purchasePayTypeCode = extended[1].u(6),
+            purchasePayType = purchasePayTypeToStr(extended[1].u(6)),
+            commuterCertificateExpiry = formatDate(extended[5].beInt(10, 12)),
+        )
+    }
+
+    fun readAutoChargeInformation(extended: List<ByteArray>): AutoCharge {
+        val block = extended[9]
+        return AutoCharge(
+            contracted = ((block.u(0) shr 7) and 1) == 1,
+            enabled = ((block.u(0) shr 6) and 1) == 1,
+            chargeAmount = (block.u(0) and 0x0F) * 1000,
+            threshold = ((block.u(1) shr 2) and 0x0F) * 1000,
         )
     }
 
     fun readGateInOutInformation(): List<GateEntry> {
-        val blocks = readBlocks(7, 3)
+        val blocks = readBlocks(GATE_SERVICE, 3)
         val entries = ArrayList<GateEntry>()
         for ((index, block) in blocks.withIndex()) {
             // Unused gate slots come back zero-filled; skip them.
@@ -358,7 +447,7 @@ private class SuicaCardDataExtractor(
     }
 
     fun readSfGateInInformation(): SfGate {
-        val blocks = readBlocks(8, 2)
+        val blocks = readBlocks(SF_GATE_SERVICE, 2)
         val first = blocks[0]
         val second = blocks[1]
         val hasRecord = first.any { it.toInt() != 0 } || second.any { it.toInt() != 0 }
@@ -432,7 +521,7 @@ class SuicaCardReader(
             services.add(PAID_TICKET_SERVICE_NODE_ID)
         }
 
-        var authResult: JSONObject
+        var authResult: AuthenticationResult
         try {
             authResult = client.mutualAuthentication(SYSTEM_CODE, AREA_NODE_IDS, services)
         } catch (e: Exception) {
@@ -449,7 +538,9 @@ class SuicaCardReader(
 
         val systemInfo = buildSystemInfo(authResult)
 
-        val reader = RemoteCardReader(client)
+        // Adopt the session the server established; from here the card is read
+        // locally and the server is out of the picture.
+        val reader = SecureCardReader(SecureCardChannel(authResult.session, transceive))
         val extractor = SuicaCardDataExtractor(reader, stations)
 
         val issuePrimary = extractor.readIssueInformationPrimary(); progress(45)
@@ -457,7 +548,9 @@ class SuicaCardReader(
         val lastTopup = extractor.readLastTopupInformation(); progress(65)
         val unknown = extractor.readUnknownInformation(); progress(75)
         val history = extractor.readTransactionHistory(); progress(85)
-        val commuter = extractor.readCommuterPassInformation(); progress(92)
+        val extended = extractor.readExtendedInformation()
+        val commuter = extractor.readCommuterPassInformation(extended)
+        val autoCharge = extractor.readAutoChargeInformation(extended); progress(92)
         val gate = extractor.readGateInOutInformation(); progress(97)
         val sfGate = extractor.readSfGateInInformation()
 
@@ -482,6 +575,7 @@ class SuicaCardReader(
             unknown = unknown,
             transactionHistory = history,
             commuter = commuter,
+            autoCharge = autoCharge,
             gate = gate,
             sfGate = sfGate,
             paidTicket = paidTicket,
@@ -518,32 +612,19 @@ class SuicaCardReader(
         return response.u(11) or (response.u(12) shl 8)
     }
 
-    private fun buildSystemInfo(authResult: JSONObject): SystemInfo {
-        val idiHex = (firstNonEmpty(authResult, "issue_id", "idi")).uppercase()
-        val pmiHex = (firstNonEmpty(authResult, "issue_parameter", "pmi")).uppercase()
-        if (idiHex.isEmpty()) throw FelicaRemoteClientError("サーバ応答に Issue ID が含まれていません。")
-        if (pmiHex.isEmpty()) throw FelicaRemoteClientError("サーバ応答に Issue Parameter が含まれていません。")
-
+    private fun buildSystemInfo(authResult: AuthenticationResult): SystemInfo {
         val idiBytes = try {
-            idiHex.hexToBytes()
+            authResult.issueIdHex.hexToBytes()
         } catch (e: Exception) {
             throw FelicaRemoteClientError("Issue ID の形式が不正です。")
         }
         return SystemInfo(
             idmHex = idm.toHexUpper(),
             pmmHex = pmm.toHexUpper(),
-            idiHex = idiHex,
+            idiHex = authResult.issueIdHex,
             idiDisplay = idiBytesToStr(idiBytes),
-            pmi = pmiHex,
+            pmi = authResult.issueParameterHex,
         )
-    }
-
-    private fun firstNonEmpty(obj: JSONObject, vararg keys: String): String {
-        for (key in keys) {
-            val value = obj.optString(key, "")
-            if (value.isNotEmpty()) return value
-        }
-        return ""
     }
 }
 
@@ -565,6 +646,17 @@ private fun ByteArray.leInt(from: Int, toExclusive: Int): Int {
         shift += 8
     }
     return value
+}
+
+/** Reads packed BCD digits, two per byte, as they are printed on the card. */
+private fun decodeBcd(bytes: ByteArray): String {
+    val sb = StringBuilder(bytes.size * 2)
+    for (b in bytes) {
+        val value = b.toInt() and 0xFF
+        sb.append('0' + (value shr 4))
+        sb.append('0' + (value and 0x0F))
+    }
+    return sb.toString()
 }
 
 private fun ByteArray.hexUpper(from: Int, toExclusive: Int): String {
@@ -597,13 +689,14 @@ private fun buildCardDataJson(data: CardData): JSONObject = JSONObject().apply {
         put("issued_station", data.issuePrimary.issuedStation)
         put("issued_at", data.issuePrimary.issuedAt)
         put("expires_at", data.issuePrimary.expiresAt)
+        put("collected", data.issuePrimary.collected)
     })
     put("attribute", JSONObject().apply {
-        put("card_type_code", data.attribute.cardTypeCode)
-        put("card_type", data.attribute.cardType)
-        put("region", data.attribute.region)
         put("balance", data.attribute.balance)
         put("transaction_number", data.attribute.transactionNumber)
+        put("voice_guidance", data.attribute.voiceGuidance)
+        put("sf_outside_commuter", data.attribute.sfOutsideCommuter)
+        put("touch_de_go", data.attribute.touchDeGo)
     })
     put("last_topup", JSONObject().apply {
         put("equipment_code", data.lastTopup.equipmentCode)
@@ -639,6 +732,8 @@ private fun buildCardDataJson(data: CardData): JSONObject = JSONObject().apply {
         }
     })
     put("commuter", JSONObject().apply {
+        put("issuer_id", data.commuter.issuerId)
+        put("issuer_id_hex", data.commuter.issuerIdHex)
         put("valid_from", data.commuter.validFrom)
         put("valid_to", data.commuter.validTo)
         put("start_station", data.commuter.startStation)
@@ -646,6 +741,18 @@ private fun buildCardDataJson(data: CardData): JSONObject = JSONObject().apply {
         put("via1_station", data.commuter.via1Station)
         put("via2_station", data.commuter.via2Station)
         put("issued_at", data.commuter.issuedAt)
+        put("pass_number", data.commuter.passNumber)
+        put("r_number", data.commuter.rNumber)
+        put("sale_price", data.commuter.salePrice)
+        put("purchase_pay_type_code", data.commuter.purchasePayTypeCode)
+        put("purchase_pay_type", data.commuter.purchasePayType)
+        put("commuter_certificate_expiry", data.commuter.commuterCertificateExpiry)
+    })
+    put("auto_charge", JSONObject().apply {
+        put("contracted", data.autoCharge.contracted)
+        put("enabled", data.autoCharge.enabled)
+        put("charge_amount", data.autoCharge.chargeAmount)
+        put("threshold", data.autoCharge.threshold)
     })
     put("gate", JSONArray().apply {
         for (g in data.gate) {

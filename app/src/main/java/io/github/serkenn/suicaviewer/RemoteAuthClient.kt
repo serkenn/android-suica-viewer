@@ -14,11 +14,28 @@ class FelicaRemoteClientError(message: String) : Exception(message)
 class CardCommandError(val statusCode: Int) :
     Exception("カードがエラーを返しました: 0x%04X".format(statusCode))
 
+/** What the server returns once mutual authentication completes. */
+data class AuthenticationResult(
+    /** Issue ID (IDi) as uppercase hex. */
+    val issueIdHex: String,
+    /** Issue parameter (PMi) as uppercase hex. */
+    val issueParameterHex: String,
+    /** The ephemeral secure session, which the client drives from here on. */
+    val session: SecureSession,
+)
+
+/** The only secure-session scheme the server issues. */
+private const val DES_SCHEME = "des"
+
 /**
- * Coordinates card I/O with the remote crypto server, ported from
- * `suica_viewer/auth_client.py`. The server performs all cryptography; this
- * client is a relay that forwards the server-built FeliCa frames to the card
- * (via [transceive]) and returns the card's response back to the server.
+ * Coordinates the mutual authentication with the remote crypto server, ported
+ * from the desktop viewer's `auth_client`.
+ *
+ * The server's involvement ends there: it builds each authentication frame, this
+ * client puts it on the card (via [transceive]) and sends the card's reply back,
+ * and on success the server hands over the ephemeral session material and
+ * forgets the session. Every encrypted read afterwards runs locally through
+ * [SecureCardChannel], so no card data reaches the network.
  */
 class RemoteAuthClient(
     serverUrl: String,
@@ -28,12 +45,15 @@ class RemoteAuthClient(
     /** Sends a raw FeliCa frame to the card and returns its response. */
     private val transceive: (ByteArray) -> ByteArray,
 ) {
-    private val baseUrl: String = serverUrl.trimEnd('/').ifEmpty { serverUrl }
+    private val baseUrl: String = validateServerUrl(serverUrl)
     private var sessionId: String? = null
-    private var authenticated = false
 
-    /** Perform a remote mutual authentication sequence; returns the server result object. */
-    fun mutualAuthentication(systemCode: Int, areas: List<Int>, services: List<Int>): JSONObject {
+    /** Perform a remote mutual authentication sequence. */
+    fun mutualAuthentication(
+        systemCode: Int,
+        areas: List<Int>,
+        services: List<Int>,
+    ): AuthenticationResult {
         val request = JSONObject().apply {
             put("session_id", sessionId ?: JSONObject.NULL)
             put("idm", idm.toHexLower())
@@ -61,50 +81,19 @@ class RemoteAuthClient(
                     updateSessionId(response)
                 }
                 "complete" -> {
-                    authenticated = true
-                    return response.optJSONObject("result") ?: JSONObject()
+                    // The server discards the session the moment it hands the
+                    // material over, so the id is already dead here.
+                    sessionId = null
+                    return authenticationResult(response)
                 }
                 else -> throw FelicaRemoteClientError("unexpected server response: $response")
             }
         }
     }
 
-    /** Send an encrypted command through the server and return the plaintext response. */
-    fun encryptionExchange(cmdCode: Int, payload: ByteArray): ByteArray {
-        if (!authenticated) {
-            throw FelicaRemoteClientError("mutual authentication must be completed first")
-        }
-        val request = JSONObject().apply {
-            put("session_id", sessionId ?: JSONObject.NULL)
-            put("cmd_code", cmdCode)
-            put("payload", payload.toHexLower())
-        }
-
-        var response = post("/encryption-exchange", request)
-        updateSessionId(response)
-
-        val frame = extractCommandFrame(response)
-        val cardResponse = transceive(frame)
-        val finalResponse = post(
-            "/encryption-exchange",
-            JSONObject().apply {
-                put("session_id", sessionId ?: JSONObject.NULL)
-                put("card_response", cardResponse.toHexLower())
-            },
-        )
-        updateSessionId(finalResponse)
-
-        val responseHex = finalResponse.optString("response", "")
-        if (responseHex.isEmpty()) {
-            throw FelicaRemoteClientError("unexpected server response: $finalResponse")
-        }
-        return responseHex.hexToBytes()
-    }
-
     /** Reset session state so the transport can be reused for a fresh authentication. */
     fun reset() {
         sessionId = null
-        authenticated = false
     }
 
     private fun extractCommandFrame(response: JSONObject): ByteArray {
@@ -123,7 +112,7 @@ class RemoteAuthClient(
     }
 
     private fun post(path: String, payload: JSONObject): JSONObject {
-        val decoded = postRaw(path, payload)
+        val decoded = postWithRetry(path, payload)
         val error = decoded.optJSONObject("error")
         if (error != null) {
             if (error.has("code") && !error.isNull("code")) {
@@ -132,6 +121,22 @@ class RemoteAuthClient(
             throw FelicaRemoteClientError(error.optString("message", "server reported an error"))
         }
         return decoded
+    }
+
+    /**
+     * A transport hiccup is retried once: a pooled connection can be closed by
+     * the far end between requests, through no fault of this request.
+     */
+    private fun postWithRetry(path: String, payload: JSONObject): JSONObject {
+        var lastError: java.io.IOException? = null
+        repeat(2) {
+            try {
+                return postRaw(path, payload)
+            } catch (e: java.io.IOException) {
+                lastError = e
+            }
+        }
+        throw FelicaRemoteClientError("サーバ通信エラー: ${lastError?.message ?: "原因不明のエラー"}")
     }
 
     private fun postRaw(path: String, payload: JSONObject): JSONObject {
@@ -173,6 +178,76 @@ class RemoteAuthClient(
             default to null
         }
     }
+}
+
+/**
+ * Normalizes and checks a server URL up front, so a typo surfaces before a card
+ * is ever touched rather than as a confusing mid-authentication failure.
+ */
+fun validateServerUrl(serverUrl: String): String {
+    val trimmed = serverUrl.trim().trimEnd('/')
+    val scheme = trimmed.substringBefore("://", "").lowercase()
+    if (scheme != "http" && scheme != "https") {
+        throw FelicaRemoteClientError("認証サーバの URL は http または https である必要があります。")
+    }
+    if (trimmed.substringAfter("://", "").isEmpty()) {
+        throw FelicaRemoteClientError("認証サーバの URL にホスト名がありません。")
+    }
+    return trimmed
+}
+
+/** Reads the completed authentication out of the server's final reply. */
+private fun authenticationResult(response: JSONObject): AuthenticationResult {
+    val result = response.optJSONObject("result") ?: JSONObject()
+
+    fun field(vararg names: String): String {
+        for (name in names) {
+            val value = result.optString(name, "")
+            if (value.isNotEmpty()) return value.uppercase()
+        }
+        return ""
+    }
+
+    val issueIdHex = field("issue_id", "idi")
+    if (issueIdHex.isEmpty()) {
+        throw FelicaRemoteClientError("サーバ応答に Issue ID が含まれていません。")
+    }
+    val issueParameterHex = field("issue_parameter", "pmi")
+    if (issueParameterHex.isEmpty()) {
+        throw FelicaRemoteClientError("サーバ応答に Issue Parameter が含まれていません。")
+    }
+    runCatching { issueIdHex.hexToBytes() }
+        .getOrElse { throw FelicaRemoteClientError("Issue ID の形式が不正です。") }
+
+    val session = result.optJSONObject("session")
+        ?: throw FelicaRemoteClientError(
+            "サーバ応答にセッション情報が含まれていません。認証サーバが対応バージョンか確認してください。",
+        )
+    return AuthenticationResult(issueIdHex, issueParameterHex, secureSession(session))
+}
+
+/** Reads the ephemeral session material the server established with the card. */
+private fun secureSession(session: JSONObject): SecureSession {
+    val scheme = session.optString("scheme", DES_SCHEME)
+    if (!scheme.equals(DES_SCHEME, ignoreCase = true)) {
+        throw FelicaRemoteClientError("未対応のセッション方式です: $scheme")
+    }
+
+    fun bytes(name: String, size: Int): ByteArray {
+        val value = session.optString(name, "")
+        if (value.isEmpty()) throw FelicaRemoteClientError("セッション情報に $name がありません。")
+        val decoded = runCatching { value.hexToBytes() }.getOrNull()
+        if (decoded == null || decoded.size != size) {
+            throw FelicaRemoteClientError("セッション情報の $name が不正です（$size バイトの hex が必要）。")
+        }
+        return decoded
+    }
+
+    val transactionNumber = session.optInt("transaction_number", -1)
+    if (transactionNumber !in 0..0xFFFF) {
+        throw FelicaRemoteClientError("セッション情報の transaction_number が不正です。")
+    }
+    return SecureSession(bytes("key", 8), bytes("transaction_id", 6), transactionNumber)
 }
 
 fun ByteArray.toHexLower(): String = joinToString("") { "%02x".format(it) }
